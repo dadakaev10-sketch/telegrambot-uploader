@@ -1,49 +1,33 @@
-# Telegrambot
+# Telegrambot Camoufox
 
-Der Bot verwendet eine lokale Queue pro Mac und einen gemeinsamen PostgreSQL-Medienbestand.
+Telegram-Uploader mit lokaler Queue, gemeinsamem PostgreSQL-Medienbestand und
+Camoufox als Browser-Backend.
 
-## Installation auf einem weiteren Mac
+## Installation auf einem Mac
 
 ```bash
-git clone <REPOSITORY-URL>
-cd telegrambot
+git clone https://github.com/dadakaev10-sketch/telegrambot-uploader.git
+cd telegrambot-uploader
 ./setup_mac.sh
 ```
 
-Danach `.env` ausfüllen. Jeder Mac benötigt:
-
-- einen eigenen `BOT_TOKEN`, wenn beide Bots gleichzeitig Telegram-Polling verwenden;
-- einen eigenen Wert für `TELETHON_SESSION`;
-- dieselbe `DATABASE_URL`, damit beide Bots denselben Erledigt-Stand sehen.
-
-Eine neue Telethon-Session wird so erstellt:
+Danach `.env` ausfüllen und eine eigene Telethon-Session erstellen:
 
 ```bash
 ./venv/bin/python create_session.py
 ```
 
-Bot starten:
+Start per Terminal:
 
 ```bash
 ./venv/bin/python bot.py
 ```
 
-Das Setup erstellt außerdem `~/Applications/Telegrambot Uploader.app`. Diese App
-kann per Doppelklick gestartet oder in das Dock gezogen werden. Sie öffnet ein
-Terminalfenster mit dem Bot-Log und verhindert einen zweiten gleichzeitigen Start.
+Das Setup erzeugt außerdem `~/Applications/Telegrambot Camoufox.app`. Die App
+kann per Doppelklick gestartet oder ins Dock gezogen werden.
 
-Der automatische Watchcheck ist deaktiviert. Er wird ausschließlich über den Button
-`Watchcheck` oder den Befehl `/watchcheck` gestartet.
+Der automatische Watchcheck ist deaktiviert. Die Watchlist wird nur über den
+Button `Watchcheck` oder `/watchcheck` geprüft.
 
-## Nicht im Repository
-
-Folgende Daten bleiben absichtlich lokal:
-
-- `.env`;
-- `venv/`;
-- Telethon-Sessiondateien;
-- `bot/queue.json`, Watchlist und Fortschritt;
-- lokale Datenbanken, Downloads und Logs.
-
-Zusätzlich zu den Python-Paketen werden Homebrew, FFmpeg und ffprobe benötigt. Das
-macOS-Setup-Skript installiert beziehungsweise prüft diese Abhängigkeiten.
+Lokale Zugangsdaten, Sessions, Queue, Watchlist, Datenbanken, Downloads und Logs
+werden nicht über GitHub übertragen.

@@ -46,8 +46,8 @@ info "Python-Werkzeuge und Bot-Abhängigkeiten installieren"
 ./venv/bin/python -m pip install --upgrade pip setuptools wheel
 ./venv/bin/python -m pip install --requirement requirements.txt
 
-info "Playwright Chromium installieren"
-./venv/bin/playwright install chromium
+info "camoufox-Browser (Firefox) installieren"
+./venv/bin/python -m camoufox fetch
 
 if [[ ! -f .env ]]; then
   cp .env.example .env
@@ -72,4 +72,4 @@ printf '%s\n' "Danach bei Bedarf eine eigene Telethon-Session erstellen:"
 printf '%s\n' "  ./venv/bin/python create_session.py"
 printf '%s\n' "Bot starten:"
 printf '%s\n' "  ./venv/bin/python bot.py"
-printf '%s\n' "Oder per App: ~/Applications/Telegrambot Uploader.app"
+printf '%s\n' "Oder per App: ~/Applications/Telegrambot Camoufox.app"

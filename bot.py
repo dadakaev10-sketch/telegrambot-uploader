@@ -20,7 +20,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotComm
 from telegram.error import BadRequest as TgBadRequest, RetryAfter as TgRetryAfter
 from telegram.ext import Application, MessageHandler, CallbackQueryHandler, CommandHandler, filters, ContextTypes
 from telethon import TelegramClient
-from playwright.async_api import async_playwright
+from camoufox.async_api import AsyncCamoufox
 from central_media_db import CentralMediaDB
 
 # ─── Config aus .env laden ────────────────────────
@@ -42,6 +42,9 @@ DB_PATH       = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'media.
 DATABASE_URL  = os.getenv('DATABASE_URL', '').strip()
 _central_media_db = CentralMediaDB(DATABASE_URL) if DATABASE_URL else None
 RUN_TELEGRAM_POLLING = os.getenv('RUN_TELEGRAM_POLLING', 'true').lower() in ('1', 'true', 'yes', 'on')
+# camoufox läuft headless (kein Fenster pro Folge). Falls ALTCHA/VOE mal hängt,
+# SERIENSTREAM_HEADFUL=1 setzen → Browser wird sichtbar (zur Diagnose/Edge-Case).
+SERIENSTREAM_HEADFUL = os.getenv('SERIENSTREAM_HEADFUL', '').lower() in ('1', 'true', 'yes', 'on')
 
 # Einheitlicher User-Agent für Playwright + yt-dlp + ffmpeg + requests
 # Muss überall gleich sein, sonst lehnt der CDN auth-token URLs ab
@@ -112,29 +115,6 @@ def _spawn_task(coro, name: str):
 _sys = platform.system()
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if _sys == "Windows" else 0
 
-def _find_brave() -> str:
-    if _sys == "Darwin":
-        return "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
-    elif _sys == "Windows":
-        candidates = [
-            r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
-            r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
-            os.path.join(os.environ.get("LOCALAPPDATA", ""), r"BraveSoftware\Brave-Browser\Application\brave.exe"),
-        ]
-        for p in candidates:
-            if p and os.path.exists(p):
-                return p
-        return candidates[0]
-    return "/usr/bin/brave-browser"
-
-if os.getenv("BRAVE_PATH"):
-    BRAVE_PATH = os.getenv("BRAVE_PATH")
-else:
-    BRAVE_PATH = _find_brave()
-
-# Fallback: wenn Brave nicht existiert, Playwright-Chromium nutzen
-if not os.path.exists(BRAVE_PATH):
-    BRAVE_PATH = None
 # ──────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO)
@@ -493,14 +473,11 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None) 
     cookie_str = ""
     source_voe_url = None  # zum DB-Vergleich (erkennt Re-Uploads in besserer Qualität)
 
-    async with async_playwright() as p:
+    async with AsyncCamoufox(headless=not SERIENSTREAM_HEADFUL) as browser:
         # ALTCHA rechnet den Proof-of-Work im sichtbaren Browser zuverlässig aus;
-        # im Chromium-Headless-Modus bleibt das Widget dauerhaft "unverified".
-        _launch_opts = {"headless": not _is_seriesstream_url(page_url)}
-        if BRAVE_PATH:
-            _launch_opts["executable_path"] = BRAVE_PATH
-        browser = await p.chromium.launch(**_launch_opts)
-        context = await browser.new_context(user_agent=USER_AGENT)
+        # camoufox löst das auch headless → kein Fenster pro Folge. Bei Problemen
+        # SERIENSTREAM_HEADFUL=1 setzen, dann läuft der Browser sichtbar.
+        context = await browser.new_context()
 
         BLOCKED_SCRIPT_HOSTS = (
             'rutseasickmunch.com',
@@ -837,34 +814,53 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None) 
         elif _is_seriesstream_url(page_url):
             page_url = _normalize_seriesstream_url(page_url)
             logging.info(f"SerienStream: Öffne Episode: {page_url}")
-            await page.goto(page_url, timeout=60000, wait_until='domcontentloaded')
+            await page.goto(page_url, timeout=120000, wait_until='domcontentloaded')
             await asyncio.sleep(2)
 
             # Die Seite lädt den bevorzugten deutschen VOE-Hoster automatisch.
             # Falls das Modal noch nicht offen ist, den deutschen VOE-Button auslösen.
-            modal_visible = await page.locator('#playerPrepareModal.show').count() > 0
-            if not modal_visible:
+            modal = page.locator('#playerPrepareModal.show')
+            if await modal.count() == 0:
                 voe_button = page.locator(
                     '.link-box[data-provider-name="VOE"][data-language-id="1"]'
                 )
                 if await voe_button.count() == 1:
                     await voe_button.click()
-                    await asyncio.sleep(1)
+            try:
+                await modal.wait_for(timeout=30000)
+            except Exception:
+                logging.warning("SerienStream: Player-Modal nicht sichtbar geworden")
+            await asyncio.sleep(1)
 
             captcha = page.locator(
                 '#playerPrepareModal altcha-widget input[type="checkbox"]'
             )
             if await captcha.count() == 1 and not await captcha.is_checked():
                 logging.info("SerienStream: ALTCHA wird bestätigt")
-                # Das native Input ist vom sichtbaren Label überlagert. Ein
-                # erzwungener Input-Klick setzt zwar den Haken, startet aber den
-                # ALTCHA-Proof-of-Work nicht. Deshalb das echte Label anklicken.
-                captcha_label = page.locator(
-                    '#playerPrepareModal altcha-widget label[for^="altcha_checkbox_"]'
-                )
-                if await captcha_label.count() != 1:
-                    raise RuntimeError("SerienStream: ALTCHA-Label nicht gefunden")
-                await captcha_label.click(force=True, timeout=10000)
+                # ALTCHA-Proof-of-Work auslösen: Das Widget lauscht auf das
+                # change-Event der Checkbox. Ein Playwright-Klick auf das Label
+                # timed out unter proot/Android (Actionability-Check); wir setzen
+                # die Checkbox per JS und dispatchen change/input → der PoW
+                # startet zuverlässig (Desktop UND Handy). Label-Klick als Fallback.
+                triggered = await page.evaluate("""() => {
+                    const inp = document.querySelector('#playerPrepareModal altcha-widget input[type="checkbox"]');
+                    if (!inp) return false;
+                    if (!inp.checked) {
+                        inp.checked = true;
+                        inp.dispatchEvent(new Event('change', {bubbles: true}));
+                        inp.dispatchEvent(new Event('input', {bubbles: true}));
+                    }
+                    return true;
+                }""")
+                if not triggered:
+                    captcha_label = page.locator(
+                        '#playerPrepareModal altcha-widget label[for^="altcha_checkbox_"]'
+                    )
+                    if await captcha_label.count() == 1:
+                        try:
+                            await captcha_label.click(force=True, timeout=30000)
+                        except Exception:
+                            pass
                 try:
                     await page.wait_for_function(
                         """() => {
@@ -872,19 +868,34 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None) 
                             const payload = document.querySelector('#playerPrepareModal input[name="altcha"]');
                             return widget?.dataset?.state === 'verified' && !!payload?.value;
                         }""",
-                        timeout=30000,
+                        timeout=180000,
                     )
                 except Exception as e:
                     raise RuntimeError(f"SerienStream ALTCHA fehlgeschlagen: {e}") from e
 
             submit = page.locator('#playerPrepareModal button[type="submit"]')
             if await submit.count() == 1:
-                await submit.click()
+                try:
+                    await submit.wait_for(state='visible', timeout=30000)
+                except Exception:
+                    pass
+                # Submit per JS auslösen (force-Klick feuert unter proot/Android
+                # den Form-Handler nicht zuverlässig); Playwright-Klick als Fallback.
+                js_clicked = await page.evaluate("""() => {
+                    const b = document.querySelector('#playerPrepareModal button[type="submit"]');
+                    if (b) { b.click(); return true; }
+                    return false;
+                }""")
+                if not js_clicked:
+                    try:
+                        await submit.click(force=True, timeout=60000)
+                    except Exception:
+                        pass
 
             # Das Formular navigiert gezielt das Player-iframe. Auf dessen finaler
             # URL liegt der VOE-Player (die Domain wechselt regelmäßig).
             voe_url = None
-            for _ in range(30):
+            for _ in range(120):
                 for frame in page.frames:
                     frame_url = frame.url or ''
                     if '/e/' in frame_url and not _is_seriesstream_url(frame_url):
@@ -899,7 +910,7 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None) 
 
             source_voe_url = voe_url
             logging.info(f"SerienStream: VOE URL extrahiert: {voe_url}")
-            await page.goto(voe_url, timeout=60000, wait_until='domcontentloaded')
+            await page.goto(voe_url, timeout=120000, wait_until='domcontentloaded')
             await asyncio.sleep(3)
 
         # ─── Serie: Seite direkt öffnen ───
@@ -1104,11 +1115,7 @@ async def download_with_browser(stream_url: str, filepath: str, referer: str | N
     logging.info(f"Browser-Download startet: {stream_url[:120]}")
     import time as _time
 
-    async with async_playwright() as p:
-        _launch_opts = {"headless": True}
-        if BRAVE_PATH:
-            _launch_opts["executable_path"] = BRAVE_PATH
-        browser = await p.chromium.launch(**_launch_opts)
+    async with AsyncCamoufox(headless=True) as browser:
 
         cookies_for_context = []
         if cookie_str and referer:
@@ -1972,12 +1979,8 @@ async def get_series_episodes(series_url: str, is_anime: bool = False) -> tuple[
             logging.info(f"Serie: {skip_count}/{len(episodes)} Folgen bereits vorhanden → werden übersprungen")
         return series_title, episodes
 
-    async with async_playwright() as pw:
-        _launch_opts = {"headless": True}
-        if BRAVE_PATH:
-            _launch_opts["executable_path"] = BRAVE_PATH
-        browser = await pw.chromium.launch(**_launch_opts)
-        context = await browser.new_context(user_agent=USER_AGENT)
+    async with AsyncCamoufox(headless=True) as browser:
+        context = await browser.new_context()
         page = await context.new_page()
 
         # ── hdfilme.win Serien ──────────────────────────────────────────────
@@ -2819,12 +2822,8 @@ async def get_bulk_films_from_page(listing_url: str) -> list[dict]:
     """Scrapet alle Filmlinks von einer megakino1.club Listing-Seite."""
     print(f"[BULK] Playwright startet für: {listing_url}", flush=True)
     logging.info(f"Bulk-Filme: Lade Seite {listing_url}")
-    async with async_playwright() as pw:
-        _launch_opts = {"headless": True}
-        if BRAVE_PATH:
-            _launch_opts["executable_path"] = BRAVE_PATH
-        browser = await pw.chromium.launch(**_launch_opts)
-        context = await browser.new_context(user_agent=USER_AGENT)
+    async with AsyncCamoufox(headless=True) as browser:
+        context = await browser.new_context()
         page = await context.new_page()
         print("[BULK] Browser geöffnet, lade Seite...", flush=True)
         await page.goto(listing_url, timeout=60000, wait_until='domcontentloaded')
@@ -2999,12 +2998,8 @@ def _parse_megakino_last_added_html(html: str, base_url: str) -> list[dict]:
 
 async def get_megakino_last_added(home_url: str = MEGAKINO_HOME_URL) -> list[dict]:
     logging.info(f"Megakino Last Added: Lade Startseite {home_url}")
-    async with async_playwright() as pw:
-        _launch_opts = {"headless": True}
-        if BRAVE_PATH:
-            _launch_opts["executable_path"] = BRAVE_PATH
-        browser = await pw.chromium.launch(**_launch_opts)
-        context = await browser.new_context(user_agent=USER_AGENT)
+    async with AsyncCamoufox(headless=True) as browser:
+        context = await browser.new_context()
         page = await context.new_page()
         await page.goto(home_url, timeout=60000, wait_until='domcontentloaded')
         await asyncio.sleep(3)
@@ -3238,12 +3233,8 @@ def _kinoger_best_quality_height(embed_url: str) -> int | None:
 async def _kinoger_resolve_browser_media(embed_url: str, preferred_qualities: tuple[str, ...] = ('720p', '1080p', '360p')) -> str | None:
     """Resolve the short-lived playback URL that incvideo creates in a real browser."""
     try:
-        async with async_playwright() as pw:
-            launch_opts = {"headless": True}
-            if BRAVE_PATH:
-                launch_opts["executable_path"] = BRAVE_PATH
-            browser = await pw.chromium.launch(**launch_opts)
-            context = await browser.new_context(user_agent=USER_AGENT)
+        async with AsyncCamoufox(headless=True) as browser:
+            context = await browser.new_context()
             page = await context.new_page()
             media_urls: list[str] = []
 
@@ -4463,17 +4454,13 @@ def _sto_scrape(series_url: str) -> dict:
             logging.warning(f"_sto_scrape (requests): {e}")
             return None
 
-    def _seasons_via_playwright() -> dict | None:
-        """DDoS-Guard umgehen: per echtem Browser laden. Sync-API (läuft im Thread)."""
+    def _seasons_via_camoufox() -> dict | None:
+        """DDoS-Guard umgehen: per echtem Browser (camoufox) laden. Sync-API (läuft im Thread)."""
         try:
-            from playwright.sync_api import sync_playwright as _spw
+            from camoufox.sync_api import Camoufox as _Camoufox
             import time as _t
-            with _spw() as p:
-                opts = {"headless": True}
-                if BRAVE_PATH:
-                    opts["executable_path"] = BRAVE_PATH
-                br = p.chromium.launch(**opts)
-                ctx = br.new_context(user_agent=USER_AGENT)
+            with _Camoufox(headless=True) as br:
+                ctx = br.new_context()
                 pg = ctx.new_page()
                 pg.goto(base, timeout=60000, wait_until='domcontentloaded')
                 _t.sleep(2)
@@ -4492,15 +4479,15 @@ def _sto_scrape(series_url: str) -> dict:
                 br.close()
                 return {'title': data['title'], 'base_url': base, 'seasons': seasons}
         except Exception as e:
-            logging.warning(f"_sto_scrape (playwright): {e}")
+            logging.warning(f"_sto_scrape (camoufox): {e}")
             return None
 
     result = _seasons_via_requests()
     if result and result['seasons']:
         return result
 
-    logging.info("_sto_scrape: Fallback auf Playwright (DDoS-Guard vermutet)")
-    result = _seasons_via_playwright()
+    logging.info("_sto_scrape: Fallback auf camoufox (DDoS-Guard vermutet)")
+    result = _seasons_via_camoufox()
     if result:
         return result
 

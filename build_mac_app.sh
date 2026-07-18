@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAUNCHER="$ROOT_DIR/start_bot.command"
 APP_DIR="$HOME/Applications"
-APP_PATH="$APP_DIR/Telegrambot Uploader.app"
+APP_PATH="$APP_DIR/Telegrambot Camoufox.app"
 
 [[ "$(uname -s)" == "Darwin" ]] || { echo "Dieses Skript ist nur für macOS." >&2; exit 1; }
 command -v osacompile >/dev/null 2>&1 || { echo "osacompile wurde nicht gefunden." >&2; exit 1; }
