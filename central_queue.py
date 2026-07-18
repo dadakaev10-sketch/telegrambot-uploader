@@ -136,14 +136,15 @@ class CentralQueue:
         with self.connect() as con:
             con.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (source_key,))
             row = con.execute(
-                "SELECT * FROM download_batches WHERE source_key=%s AND status='collecting' ORDER BY id DESC LIMIT 1",
+                "SELECT * FROM download_batches WHERE source_key=%s AND status IN ('collecting','ready') ORDER BY CASE status WHEN 'ready' THEN 0 ELSE 1 END, id DESC LIMIT 1",
                 (source_key,),
             ).fetchone()
             if row:
-                con.execute(
-                    "UPDATE download_batches SET title=%s,source_url=%s,chat_id=%s,expected_jobs=%s,updated_at=now() WHERE id=%s",
-                    (title, source_url, chat_id, expected_jobs, row['id']),
-                )
+                if row['status'] == 'collecting':
+                    con.execute(
+                        "UPDATE download_batches SET title=%s,source_url=%s,chat_id=%s,expected_jobs=%s,updated_at=now() WHERE id=%s",
+                        (title, source_url, chat_id, expected_jobs, row['id']),
+                    )
                 return dict(row)
             row = con.execute(
                 "INSERT INTO download_batches(source_key,title,source_url,chat_id,expected_jobs) VALUES (%s,%s,%s,%s,%s) RETURNING *",

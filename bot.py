@@ -2416,6 +2416,18 @@ async def _extract_central_series(app: Application, chat_id: int, series_url: st
                 source_key, batch_title, series_url, chat_id, season_total,
             )
             batch_id = batch['id']
+            if batch.get('status') == 'ready':
+                completed_seasons += 1
+                logging.info(
+                    "Central-Batch #%s bereits freigegeben, Staffel %s wird nicht erneut extrahiert",
+                    batch_id, season,
+                )
+                await msg.edit_text(
+                    f"⏭ *{batch_title}* ist bereits vollständig in der Remote Queue\n"
+                    f"📚 Staffeln abgeschlossen: {completed_seasons}/{len(seasons)}",
+                    parse_mode='Markdown',
+                )
+                continue
             stored_titles = await asyncio.to_thread(_central_queue.batch_job_titles, batch_id)
             stored_count = len(stored_titles)
 
