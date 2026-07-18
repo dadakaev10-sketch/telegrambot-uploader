@@ -9,6 +9,22 @@ from psycopg.rows import dict_row
 
 
 SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS download_batches (
+    id BIGSERIAL PRIMARY KEY,
+    source_key TEXT NOT NULL,
+    title TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    chat_id BIGINT,
+    status TEXT NOT NULL DEFAULT 'collecting'
+        CHECK (status IN ('collecting', 'ready', 'completed', 'cancelled')),
+    expected_jobs INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    released_at TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS download_batches_collecting_source_uq
+    ON download_batches (source_key) WHERE status='collecting';
+
 CREATE TABLE IF NOT EXISTS download_jobs (
     id BIGSERIAL PRIMARY KEY,
     dedupe_key TEXT NOT NULL,
@@ -39,6 +55,7 @@ ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS last_error TEXT;
 ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();
 ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
 ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS batch_id BIGINT REFERENCES download_batches(id);
 
 CREATE INDEX IF NOT EXISTS download_jobs_claim_idx
     ON download_jobs (status, available_at, id);
@@ -112,13 +129,97 @@ class CentralQueue:
                 created += 1
         return {'created': created, 'existing': existing}
 
+    def get_or_create_batch(
+        self, source_key: str, title: str, source_url: str,
+        chat_id: int | None, expected_jobs: int,
+    ) -> dict:
+        with self.connect() as con:
+            con.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (source_key,))
+            row = con.execute(
+                "SELECT * FROM download_batches WHERE source_key=%s AND status='collecting' ORDER BY id DESC LIMIT 1",
+                (source_key,),
+            ).fetchone()
+            if row:
+                con.execute(
+                    "UPDATE download_batches SET title=%s,source_url=%s,chat_id=%s,expected_jobs=%s,updated_at=now() WHERE id=%s",
+                    (title, source_url, chat_id, expected_jobs, row['id']),
+                )
+                return dict(row)
+            row = con.execute(
+                "INSERT INTO download_batches(source_key,title,source_url,chat_id,expected_jobs) VALUES (%s,%s,%s,%s,%s) RETURNING *",
+                (source_key, title, source_url, chat_id, expected_jobs),
+            ).fetchone()
+            return dict(row)
+
+    def batch_job_keys(self, batch_id: int) -> set[str]:
+        with self.connect() as con:
+            rows = con.execute(
+                "SELECT dedupe_key FROM download_jobs WHERE batch_id=%s AND status <> 'cancelled'",
+                (batch_id,),
+            ).fetchall()
+            return {row['dedupe_key'] for row in rows}
+
+    def batch_job_titles(self, batch_id: int) -> set[str]:
+        with self.connect() as con:
+            rows = con.execute(
+                "SELECT payload->>'manual_title' AS title FROM download_jobs WHERE batch_id=%s AND status <> 'cancelled'",
+                (batch_id,),
+            ).fetchall()
+            return {row['title'] for row in rows if row['title']}
+
+    def enqueue_batch_job(self, batch_id: int, payload: dict) -> tuple[int, bool]:
+        clean = {k: v for k, v in payload.items() if not k.startswith('_central_')}
+        key = self.dedupe_key(clean)
+        with self.connect() as con:
+            con.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (key,))
+            row = con.execute(
+                "SELECT id FROM download_jobs WHERE dedupe_key=%s AND status IN ('queued','processing')",
+                (key,),
+            ).fetchone()
+            if row:
+                return row['id'], False
+            row = con.execute(
+                "INSERT INTO download_jobs(dedupe_key,payload,batch_id) VALUES (%s,%s::jsonb,%s) RETURNING id",
+                (key, json.dumps(clean, ensure_ascii=False), batch_id),
+            ).fetchone()
+            con.execute("UPDATE download_batches SET updated_at=now() WHERE id=%s", (batch_id,))
+            return row['id'], True
+
+    def release_batch(self, batch_id: int) -> int:
+        with self.connect() as con:
+            count = con.execute(
+                "SELECT count(*) AS n FROM download_jobs WHERE batch_id=%s AND status='queued'",
+                (batch_id,),
+            ).fetchone()['n']
+            con.execute(
+                "UPDATE download_batches SET status='ready',released_at=now(),updated_at=now() WHERE id=%s AND status='collecting'",
+                (batch_id,),
+            )
+            return count
+
+    def collecting_batches(self) -> list[dict]:
+        with self.connect() as con:
+            rows = con.execute(
+                """
+                SELECT b.id,b.title,b.source_url,b.expected_jobs,count(j.id) AS stored_jobs
+                FROM download_batches b
+                LEFT JOIN download_jobs j ON j.batch_id=b.id AND j.status <> 'cancelled'
+                WHERE b.status='collecting'
+                GROUP BY b.id ORDER BY b.created_at
+                """
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def claim(self, worker_id: str) -> dict | None:
         with self.connect() as con:
             row = con.execute(
                 """
                 WITH candidate AS (
                     SELECT id FROM download_jobs
-                    WHERE (status='queued' AND available_at <= now())
+                    WHERE (status='queued' AND available_at <= now()
+                           AND (batch_id IS NULL OR EXISTS (
+                               SELECT 1 FROM download_batches b WHERE b.id=download_jobs.batch_id AND b.status='ready'
+                           )))
                        OR (status='processing' AND locked_at < now() - (%s * interval '1 second'))
                     ORDER BY available_at, id
                     FOR UPDATE SKIP LOCKED

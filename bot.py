@@ -840,7 +840,17 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None) 
                     '.link-box[data-provider-name="VOE"][data-language-id="1"]'
                 )
                 if await voe_button.count() == 1:
-                    await voe_button.click()
+                    try:
+                        await voe_button.click(timeout=15000)
+                    except Exception:
+                        clicked = await page.evaluate("""() => {
+                            const b = document.querySelector('.link-box[data-provider-name="VOE"][data-language-id="1"]');
+                            if (!b) return false;
+                            b.click();
+                            return true;
+                        }""")
+                        if not clicked:
+                            raise RuntimeError("SerienStream: VOE-Button nicht auslösbar")
             try:
                 await modal.wait_for(timeout=30000)
             except Exception:
@@ -888,37 +898,61 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None) 
                 except Exception as e:
                     raise RuntimeError(f"SerienStream ALTCHA fehlgeschlagen: {e}") from e
 
-            submit = page.locator('#playerPrepareModal button[type="submit"]')
-            if await submit.count() == 1:
-                try:
-                    await submit.wait_for(state='visible', timeout=30000)
-                except Exception:
-                    pass
-                # Submit per JS auslösen (force-Klick feuert unter proot/Android
-                # den Form-Handler nicht zuverlässig); Playwright-Klick als Fallback.
-                js_clicked = await page.evaluate("""() => {
-                    const b = document.querySelector('#playerPrepareModal button[type="submit"]');
-                    if (b) { b.click(); return true; }
-                    return false;
-                }""")
-                if not js_clicked:
-                    try:
-                        await submit.click(force=True, timeout=60000)
-                    except Exception:
-                        pass
-
             # Das Formular navigiert gezielt das Player-iframe. Auf dessen finaler
             # URL liegt der VOE-Player (die Domain wechselt regelmäßig).
-            voe_url = None
-            for _ in range(120):
+            async def _current_voe_frame_url() -> str | None:
                 for frame in page.frames:
                     frame_url = frame.url or ''
                     if '/e/' in frame_url and not _is_seriesstream_url(frame_url):
-                        voe_url = frame_url
-                        break
+                        return frame_url
+                iframe = page.locator('#player-iframe')
+                if await iframe.count() == 1:
+                    iframe_src = await iframe.get_attribute('src')
+                    if iframe_src and '/e/' in iframe_src and not _is_seriesstream_url(iframe_src):
+                        return iframe_src
+                return None
+
+            voe_url = await _current_voe_frame_url()
+            submit = page.locator('#playerPrepareModal button[type="submit"]')
+            for submit_attempt in range(1, 4):
                 if voe_url:
                     break
-                await asyncio.sleep(0.5)
+                if await submit.count() != 1:
+                    logging.warning("SerienStream: Weiter-Button fehlt (Versuch %s)", submit_attempt)
+                    await asyncio.sleep(2)
+                    continue
+                try:
+                    await submit.wait_for(state='visible', timeout=15000)
+                except Exception:
+                    pass
+
+                # requestSubmit() durchläuft die native Formularvalidierung und
+                # übergibt den geklickten Button. Das ist zuverlässiger als ein
+                # synthetischer click(), besonders nach dem ALTCHA-Event.
+                submitted = await page.evaluate("""() => {
+                    const b = document.querySelector('#playerPrepareModal button[type="submit"]');
+                    const form = b?.form || document.querySelector('#playerPrepareModal form');
+                    if (!b || !form) return false;
+                    if (typeof form.requestSubmit === 'function') form.requestSubmit(b);
+                    else b.click();
+                    return true;
+                }""")
+                if not submitted:
+                    try:
+                        await submit.click(force=True, timeout=15000)
+                    except Exception:
+                        pass
+
+                for _ in range(60):
+                    voe_url = await _current_voe_frame_url()
+                    if voe_url:
+                        break
+                    await asyncio.sleep(0.5)
+                if not voe_url:
+                    logging.warning(
+                        "SerienStream: Keine Iframe-Navigation nach Submit-Versuch %s/3",
+                        submit_attempt,
+                    )
 
             if not voe_url:
                 raise RuntimeError("SerienStream: Keine VOE-Weiterleitung nach ALTCHA gefunden")
@@ -2366,13 +2400,25 @@ async def _extract_central_series(app: Application, chat_id: int, series_url: st
             await msg.edit_text(f"✅ {series_title}: Alle Folgen sind bereits vorhanden.")
             return
 
-        jobs: list[dict] = []
         total = len(missing)
+        source_key = f"series:{series_url.rstrip('/').lower()}"
+        batch = await asyncio.to_thread(
+            _central_queue.get_or_create_batch,
+            source_key, series_title, series_url, chat_id, total,
+        )
+        batch_id = batch['id']
+        stored_titles = await asyncio.to_thread(_central_queue.batch_job_titles, batch_id)
+        stored_count = len(stored_titles)
+
         for index, episode in enumerate(missing, 1):
             title = episode['title']
+            if title in stored_titles:
+                logging.info("Central-Batch #%s: bereits extrahiert: %s", batch_id, title)
+                continue
             await msg.edit_text(
-                f"🦊 Extrahiere VOE {index}/{total}\n`{title}`\n\n"
-                "Downloads starten erst, wenn alle Links gesammelt sind.",
+                f"🦊 Extrahiere Player {index}/{total}\n`{title}`\n\n"
+                f"💾 Bereits dauerhaft gespeichert: {stored_count}/{total}\n"
+                "Der Remote-Download wartet auf die vollständige Freigabe.",
                 parse_mode='Markdown',
             )
             extraction_type = episode.get('content_type') or 'serie'
@@ -2381,28 +2427,33 @@ async def _extract_central_series(app: Application, chat_id: int, series_url: st
             )
             if not _central_source_url_is_valid(source_url, episode['url']):
                 raise RuntimeError(f"Keine gültige VOE-/Doodstream-URL für {title}")
-            jobs.append({
+            payload = {
                 'type': 'video',
                 'url': source_url,
                 'content_type': 'serie',
                 'manual_title': title,
                 'is_anime': False,
                 'chat_id': chat_id,
-            })
+            }
+            _job_id, created = await asyncio.to_thread(
+                _central_queue.enqueue_batch_job, batch_id, payload
+            )
+            if created:
+                stored_count += 1
+                stored_titles.add(title)
 
-        # Eine DB-Transaktion: Worker sehen erst nach dem Commit alle Jobs.
-        result = await asyncio.to_thread(_central_queue.enqueue_many, jobs)
+        released_count = await asyncio.to_thread(_central_queue.release_batch, batch_id)
         await msg.edit_text(
             f"✅ *{series_title}* vollständig freigegeben\n"
-            f"☁️ {result['created']} neue Jobs in PostgreSQL\n"
-            f"ℹ️ {result['existing']} bereits in der Queue",
+            f"☁️ {released_count} Jobs sind jetzt für Remote bereit",
             parse_mode='Markdown',
         )
     except Exception as error:
         logging.error("Zentrale Serien-Extraktion fehlgeschlagen:\n%s", traceback.format_exc())
         await msg.edit_text(
             f"❌ Extraktion abgebrochen: {error}\n\n"
-            "Es wurde kein unvollständiger Satz an die zentrale Queue freigegeben."
+            "Bereits extrahierte Links bleiben im PostgreSQL-Entwurf gespeichert. "
+            "Starte dieselbe Serie später erneut; der Bot setzt automatisch fort."
         )
 
 
@@ -4153,22 +4204,35 @@ def _queue_item_already_done(persist: dict) -> bool:
 
 async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Zeigt aktuelle Warteschlange mit Abbrechen-Buttons."""
+    drafts = await asyncio.to_thread(_central_queue.collecting_batches) if _central_queue else []
+    draft_lines = [
+        f"🧩 *{batch['title']}* — {batch['stored_jobs']}/{batch['expected_jobs']} Links gespeichert"
+        for batch in drafts
+    ]
     if CENTRAL_QUEUE_ROLE == 'producer':
         jobs = await asyncio.to_thread(_central_queue.open_jobs)
-        if not jobs:
+        if not jobs and not drafts:
             await update.message.reply_text("✅ Zentrale Warteschlange ist leer.")
             return
         lines = []
         for job in jobs:
             marker = '▶️' if job['status'] == 'processing' else '☁️'
             lines.append(f"{marker} *#{job['id']}* {_queue_item_label(job['payload'])}")
+        sections = lines + (["\n🧩 *Noch in Extraktion:*", *draft_lines] if draft_lines else [])
         await update.message.reply_text(
-            "📋 *Zentrale PostgreSQL-Warteschlange:*\n" + "\n".join(lines),
+            "📋 *Zentrale PostgreSQL-Warteschlange:*\n" + "\n".join(sections),
             parse_mode='Markdown',
         )
         return
-    if not _dl_pending:
+    if not _dl_pending and not drafts:
         await update.message.reply_text("✅ Warteschlange ist leer.")
+        return
+
+    if not _dl_pending and drafts:
+        await update.message.reply_text(
+            "🧩 *Zentrale Serien in Extraktion:*\n" + "\n".join(draft_lines),
+            parse_mode='Markdown',
+        )
         return
 
     lines = []
@@ -4193,6 +4257,8 @@ async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
 
     text = "📋 *Warteschlange:*\n" + "\n".join(lines)
+    if draft_lines:
+        text += "\n\n🧩 *Zentrale Serien in Extraktion:*\n" + "\n".join(draft_lines)
     await update.message.reply_text(
         text, parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
