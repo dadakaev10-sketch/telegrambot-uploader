@@ -24,6 +24,22 @@ CREATE TABLE IF NOT EXISTS download_jobs (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at TIMESTAMPTZ
 );
+
+-- Migration für ältere download_jobs-Versionen. CREATE TABLE IF NOT EXISTS
+-- verändert eine bereits vorhandene Tabelle nicht, daher jede benötigte
+-- Spalte ausdrücklich und zerstörungsfrei ergänzen.
+ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
+ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS payload JSONB;
+ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'queued';
+ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0;
+ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ DEFAULT now();
+ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS locked_by TEXT;
+ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS locked_at TIMESTAMPTZ;
+ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS last_error TEXT;
+ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();
+ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
+ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+
 CREATE INDEX IF NOT EXISTS download_jobs_claim_idx
     ON download_jobs (status, available_at, id);
 CREATE UNIQUE INDEX IF NOT EXISTS download_jobs_open_dedupe_uq
