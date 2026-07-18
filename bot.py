@@ -2410,6 +2410,8 @@ async def _extract_central_series(app: Application, chat_id: int, series_url: st
 
         released_total = 0
         completed_seasons = 0
+        incomplete_seasons = 0
+        deferred_total = 0
         for season, season_episodes in sorted(seasons.items()):
             season_episodes.sort(key=lambda ep: int(ep.get('episode', 0)))
             season_total = len(season_episodes)
@@ -2447,26 +2449,53 @@ async def _extract_central_series(app: Application, chat_id: int, series_url: st
                     "Diese Staffel wartet bis zur vollständigen Freigabe.",
                     parse_mode='Markdown',
                 )
-                extraction_type = episode.get('content_type') or 'serie'
-                _stream, _title, _referer, _cookies, source_url = await get_stream_url(
-                    episode['url'], extraction_type, source_only=True
+                try:
+                    extraction_type = episode.get('content_type') or 'serie'
+                    _stream, _title, _referer, _cookies, source_url = await get_stream_url(
+                        episode['url'], extraction_type, source_only=True
+                    )
+                    if not _central_source_url_is_valid(source_url, episode['url']):
+                        raise RuntimeError(f"Keine gültige VOE-/Doodstream-URL für {title}")
+                    payload = {
+                        'type': 'video',
+                        'url': source_url,
+                        'content_type': 'serie',
+                        'manual_title': title,
+                        'is_anime': False,
+                        'chat_id': chat_id,
+                    }
+                    _job_id, created = await asyncio.to_thread(
+                        _central_queue.enqueue_batch_job, batch_id, payload
+                    )
+                    if created:
+                        stored_count += 1
+                        stored_titles.add(title)
+                except Exception as episode_error:
+                    deferred_total += 1
+                    logging.error(
+                        "Central-Batch #%s: %s wird später erneut versucht: %s",
+                        batch_id, title, episode_error,
+                    )
+                    await msg.edit_text(
+                        f"⏭ {title} vorläufig übersprungen\n"
+                        f"Grund: {episode_error}\n\n"
+                        "Der Bot macht mit der nächsten Folge weiter."
+                    )
+                    continue
+
+            if stored_count < season_total:
+                incomplete_seasons += 1
+                logging.warning(
+                    "Central-Batch #%s bleibt offen: %s/%s Links gespeichert",
+                    batch_id, stored_count, season_total,
                 )
-                if not _central_source_url_is_valid(source_url, episode['url']):
-                    raise RuntimeError(f"Keine gültige VOE-/Doodstream-URL für {title}")
-                payload = {
-                    'type': 'video',
-                    'url': source_url,
-                    'content_type': 'serie',
-                    'manual_title': title,
-                    'is_anime': False,
-                    'chat_id': chat_id,
-                }
-                _job_id, created = await asyncio.to_thread(
-                    _central_queue.enqueue_batch_job, batch_id, payload
+                await msg.edit_text(
+                    f"🧩 *{batch_title}* bleibt offen\n"
+                    f"💾 {stored_count}/{season_total} Links gespeichert\n"
+                    f"⏭ {season_total - stored_count} Folge(n) werden später erneut versucht.",
+                    parse_mode='Markdown',
                 )
-                if created:
-                    stored_count += 1
-                    stored_titles.add(title)
+                continue
 
             released = await asyncio.to_thread(_central_queue.release_batch, batch_id)
             released_total += released
@@ -2478,10 +2507,12 @@ async def _extract_central_series(app: Application, chat_id: int, series_url: st
                 parse_mode='Markdown',
             )
 
+        result_icon = "✅" if incomplete_seasons == 0 else "🧩"
         await msg.edit_text(
-            f"✅ *{series_title}*\n"
-            f"Alle {completed_seasons} fehlenden Staffel-Batches freigegeben\n"
-            f"☁️ Insgesamt {released_total} Folgen für Remote",
+            f"{result_icon} *{series_title}*\n"
+            f"☁️ {completed_seasons} Staffel-Batches freigegeben · {released_total} Folgen\n"
+            f"🧩 {incomplete_seasons} Staffel-Batches noch offen\n"
+            f"⏭ {deferred_total} Folge(n) auf später verschoben",
             parse_mode='Markdown',
         )
     except Exception as error:
