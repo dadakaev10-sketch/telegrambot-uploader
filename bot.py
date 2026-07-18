@@ -2400,52 +2400,72 @@ async def _extract_central_series(app: Application, chat_id: int, series_url: st
             await msg.edit_text(f"✅ {series_title}: Alle Folgen sind bereits vorhanden.")
             return
 
-        total = len(missing)
-        source_key = f"series:{series_url.rstrip('/').lower()}"
-        batch = await asyncio.to_thread(
-            _central_queue.get_or_create_batch,
-            source_key, series_title, series_url, chat_id, total,
-        )
-        batch_id = batch['id']
-        stored_titles = await asyncio.to_thread(_central_queue.batch_job_titles, batch_id)
-        stored_count = len(stored_titles)
+        seasons: dict[int, list[dict]] = {}
+        for episode in missing:
+            seasons.setdefault(int(episode.get('season', 0)), []).append(episode)
 
-        for index, episode in enumerate(missing, 1):
-            title = episode['title']
-            if title in stored_titles:
-                logging.info("Central-Batch #%s: bereits extrahiert: %s", batch_id, title)
-                continue
+        released_total = 0
+        completed_seasons = 0
+        for season, season_episodes in sorted(seasons.items()):
+            season_episodes.sort(key=lambda ep: int(ep.get('episode', 0)))
+            season_total = len(season_episodes)
+            source_key = f"series:{series_url.rstrip('/').lower()}:season:{season}"
+            batch_title = f"{series_title} – Staffel {season}"
+            batch = await asyncio.to_thread(
+                _central_queue.get_or_create_batch,
+                source_key, batch_title, series_url, chat_id, season_total,
+            )
+            batch_id = batch['id']
+            stored_titles = await asyncio.to_thread(_central_queue.batch_job_titles, batch_id)
+            stored_count = len(stored_titles)
+
+            for index, episode in enumerate(season_episodes, 1):
+                title = episode['title']
+                if title in stored_titles:
+                    logging.info("Central-Batch #%s: bereits extrahiert: %s", batch_id, title)
+                    continue
+                await msg.edit_text(
+                    f"🦊 *{series_title} · Staffel {season}*\n"
+                    f"Extrahiere Folge {index}/{season_total}\n`{title}`\n\n"
+                    f"💾 Gespeichert: {stored_count}/{season_total}\n"
+                    "Diese Staffel wartet bis zur vollständigen Freigabe.",
+                    parse_mode='Markdown',
+                )
+                extraction_type = episode.get('content_type') or 'serie'
+                _stream, _title, _referer, _cookies, source_url = await get_stream_url(
+                    episode['url'], extraction_type
+                )
+                if not _central_source_url_is_valid(source_url, episode['url']):
+                    raise RuntimeError(f"Keine gültige VOE-/Doodstream-URL für {title}")
+                payload = {
+                    'type': 'video',
+                    'url': source_url,
+                    'content_type': 'serie',
+                    'manual_title': title,
+                    'is_anime': False,
+                    'chat_id': chat_id,
+                }
+                _job_id, created = await asyncio.to_thread(
+                    _central_queue.enqueue_batch_job, batch_id, payload
+                )
+                if created:
+                    stored_count += 1
+                    stored_titles.add(title)
+
+            released = await asyncio.to_thread(_central_queue.release_batch, batch_id)
+            released_total += released
+            completed_seasons += 1
             await msg.edit_text(
-                f"🦊 Extrahiere Player {index}/{total}\n`{title}`\n\n"
-                f"💾 Bereits dauerhaft gespeichert: {stored_count}/{total}\n"
-                "Der Remote-Download wartet auf die vollständige Freigabe.",
+                f"✅ *{batch_title}* freigegeben\n"
+                f"☁️ {released} Folgen sind für Remote bereit\n"
+                f"📚 Staffeln abgeschlossen: {completed_seasons}/{len(seasons)}",
                 parse_mode='Markdown',
             )
-            extraction_type = episode.get('content_type') or 'serie'
-            _stream, _title, _referer, _cookies, source_url = await get_stream_url(
-                episode['url'], extraction_type
-            )
-            if not _central_source_url_is_valid(source_url, episode['url']):
-                raise RuntimeError(f"Keine gültige VOE-/Doodstream-URL für {title}")
-            payload = {
-                'type': 'video',
-                'url': source_url,
-                'content_type': 'serie',
-                'manual_title': title,
-                'is_anime': False,
-                'chat_id': chat_id,
-            }
-            _job_id, created = await asyncio.to_thread(
-                _central_queue.enqueue_batch_job, batch_id, payload
-            )
-            if created:
-                stored_count += 1
-                stored_titles.add(title)
 
-        released_count = await asyncio.to_thread(_central_queue.release_batch, batch_id)
         await msg.edit_text(
-            f"✅ *{series_title}* vollständig freigegeben\n"
-            f"☁️ {released_count} Jobs sind jetzt für Remote bereit",
+            f"✅ *{series_title}*\n"
+            f"Alle {completed_seasons} fehlenden Staffel-Batches freigegeben\n"
+            f"☁️ Insgesamt {released_total} Folgen für Remote",
             parse_mode='Markdown',
         )
     except Exception as error:
