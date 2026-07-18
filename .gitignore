@@ -1,0 +1,32 @@
+# Zugangsdaten – nur die Vorlage darf ins Repository.
+.env
+.env.*
+!.env.example
+
+# Virtuelle Umgebungen
+venv/
+.venv/
+venv.broken-*/
+
+# Telegram-/Telethon-Sitzungen
+*.session
+*.session-journal
+
+# Lokaler Laufzeitstatus: enthält URLs, Chat-IDs und Queue-Daten.
+bot/
+media.db
+*.db-wal
+*.db-shm
+
+# Downloads und temporäre Medien
+*.mp4
+*.part
+*.ts
+*.m3u8
+*_thumb.jpg
+
+# Python, macOS und Logs
+__pycache__/
+*.py[cod]
+.DS_Store
+*.log
