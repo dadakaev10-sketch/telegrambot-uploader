@@ -89,6 +89,29 @@ class CentralQueue:
             ).fetchone()
             return row['id'], True
 
+    def enqueue_many(self, payloads: list[dict]) -> dict[str, int]:
+        """Veröffentlicht einen vollständigen Satz Jobs atomar in einer Transaktion."""
+        created = 0
+        existing = 0
+        with self.connect() as con:
+            for payload in payloads:
+                clean = {k: v for k, v in payload.items() if not k.startswith('_central_')}
+                key = self.dedupe_key(clean)
+                con.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (key,))
+                row = con.execute(
+                    "SELECT id FROM download_jobs WHERE dedupe_key=%s AND status IN ('queued','processing')",
+                    (key,),
+                ).fetchone()
+                if row:
+                    existing += 1
+                    continue
+                con.execute(
+                    "INSERT INTO download_jobs(dedupe_key,payload) VALUES (%s,%s::jsonb)",
+                    (key, json.dumps(clean, ensure_ascii=False)),
+                )
+                created += 1
+        return {'created': created, 'existing': existing}
+
     def claim(self, worker_id: str) -> dict | None:
         with self.connect() as con:
             row = con.execute(

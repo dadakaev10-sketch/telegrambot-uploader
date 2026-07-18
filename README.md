@@ -58,3 +58,17 @@ Sekunden ab. Fehlgeschlagene Jobs werden mit wachsendem Abstand wieder
 freigegeben; dauerhaft gelöschte Medien landen im Status `dead`. Nach einem
 Worker-Absturz kann ein reservierter Job nach Ablauf der Lease von einem
 anderen Worker übernommen werden.
+
+## Lokal extrahieren, danach remote laden
+
+Ein normaler lokaler Bot darf `CENTRAL_QUEUE_ROLE=local` behalten. Dieser
+Befehl extrahiert zuerst alle fehlenden VOE-Links einer SerienStream-Serie:
+
+```text
+/centralserie https://serienstream.to/serie/serienname
+```
+
+Während der Extraktion wird noch kein Job veröffentlicht. Erst wenn alle
+VOE-Links erfolgreich gesammelt wurden, schreibt der Bot sie gemeinsam in
+einer PostgreSQL-Transaktion in die zentrale Queue. Ein Remote-Bot mit
+`CENTRAL_QUEUE_ROLE=worker` beginnt deshalb erst danach mit dem Download.

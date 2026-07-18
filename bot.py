@@ -50,7 +50,7 @@ if CENTRAL_QUEUE_ROLE != 'local' and not DATABASE_URL:
 _central_queue = CentralQueue(
     DATABASE_URL,
     int(os.getenv('CENTRAL_QUEUE_LEASE_SECONDS', '7200')),
-) if CENTRAL_QUEUE_ROLE != 'local' else None
+) if DATABASE_URL else None
 CENTRAL_QUEUE_WORKER_ID = (
     os.getenv('CENTRAL_QUEUE_WORKER_ID', '').strip()
     or f'{socket.gethostname()}-{uuid.uuid4().hex[:8]}'
@@ -2348,6 +2348,78 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown',
         reply_markup=MAIN_MENU,
     )
+
+
+async def _extract_central_series(app: Application, chat_id: int, series_url: str) -> None:
+    msg = await app.bot.send_message(chat_id, "🔎 Lese SerienStream-Folgen …")
+    try:
+        series_title, episodes = await get_series_episodes(series_url, False)
+        missing = [ep for ep in episodes if not ep.get('skip')]
+        if not missing:
+            await msg.edit_text(f"✅ {series_title}: Alle Folgen sind bereits vorhanden.")
+            return
+
+        jobs: list[dict] = []
+        total = len(missing)
+        for index, episode in enumerate(missing, 1):
+            title = episode['title']
+            await msg.edit_text(
+                f"🦊 Extrahiere VOE {index}/{total}\n`{title}`\n\n"
+                "Downloads starten erst, wenn alle Links gesammelt sind.",
+                parse_mode='Markdown',
+            )
+            _stream, _title, _referer, _cookies, voe_url = await get_stream_url(
+                episode['url'], 'serie'
+            )
+            if not voe_url or '/e/' not in voe_url or _is_seriesstream_url(voe_url):
+                raise RuntimeError(f"Keine gültige VOE-Embed-URL für {title}")
+            jobs.append({
+                'type': 'video',
+                'url': voe_url,
+                'content_type': 'serie',
+                'manual_title': title,
+                'is_anime': False,
+                'chat_id': chat_id,
+            })
+
+        # Eine DB-Transaktion: Worker sehen erst nach dem Commit alle Jobs.
+        result = await asyncio.to_thread(_central_queue.enqueue_many, jobs)
+        await msg.edit_text(
+            f"✅ *{series_title}* vollständig freigegeben\n"
+            f"☁️ {result['created']} neue Jobs in PostgreSQL\n"
+            f"ℹ️ {result['existing']} bereits in der Queue",
+            parse_mode='Markdown',
+        )
+    except Exception as error:
+        logging.error("Zentrale Serien-Extraktion fehlgeschlagen:\n%s", traceback.format_exc())
+        await msg.edit_text(
+            f"❌ Extraktion abgebrochen: {error}\n\n"
+            "Es wurde kein unvollständiger Satz an die zentrale Queue freigegeben."
+        )
+
+
+async def cmd_centralserie(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Extrahiert alle VOE-Links und veröffentlicht sie danach atomar."""
+    if not _central_queue:
+        await update.message.reply_text(
+            "❌ Dieser Befehl benötigt eine gültige `DATABASE_URL`."
+        )
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Verwendung: `/centralserie https://serienstream.to/serie/...`",
+            parse_mode='Markdown',
+        )
+        return
+    series_url = _normalize_seriesstream_url(context.args[0].strip())
+    if not _is_seriesstream_url(series_url):
+        await update.message.reply_text("❌ Bitte eine SerienStream-URL angeben.")
+        return
+    _spawn_task(
+        _extract_central_series(context.application, update.effective_chat.id, series_url),
+        f"central-series-{update.effective_chat.id}",
+    )
+    await update.message.reply_text("☁️ Zentrale VOE-Sammlung wurde gestartet.")
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5033,6 +5105,7 @@ async def main():
     app.add_handler(CommandHandler("filmpalast_import", cmd_filmpalast_import))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("manuel", cmd_manuel))
+    app.add_handler(CommandHandler("centralserie", cmd_centralserie))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_handler(CallbackQueryHandler(handle_type_selection, pattern="^type_"))
     app.add_handler(CallbackQueryHandler(handle_serie_type, pattern="^serie_type_"))
@@ -5052,6 +5125,7 @@ async def main():
             BotCommand("filmpalast_import", "🆕 Filmpalast neue Filme/Folgen"),
             BotCommand("status", "📊 Aktueller Download-Status"),
             BotCommand("manuel", "✍️ Manuelle Serieneingabe (VOE-Links)"),
+            BotCommand("centralserie", "☁️ Serie komplett in zentrale Queue"),
         ])
         _spawn_task(_dl_worker(), "download-worker")
 
