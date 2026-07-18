@@ -475,7 +475,8 @@ def format_filename(title: str) -> str:
 
 # ─── Stream & Download ───────────────────────────
 
-async def get_stream_url(page_url: str, content_type: str, early_db_check=None) -> tuple[str | None, str | None, str | None, str, str | None]:
+async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
+                         source_only: bool = False) -> tuple[str | None, str | None, str | None, str, str | None]:
     """Playwright öffnet URL, extrahiert ggf. iframe-URL, klickt Play, fängt Stream ab.
     Gibt (stream_url, film_title_or_None, referer_or_None, cookie_str) zurück.
 
@@ -959,6 +960,9 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None) 
 
             source_voe_url = voe_url
             logging.info(f"SerienStream: VOE URL extrahiert: {voe_url}")
+            if source_only:
+                logging.info("SerienStream: Source-only – überspringe Player/HLS-Auflösung")
+                return (None, film_title, None, "", source_voe_url)
             await page.goto(voe_url, timeout=120000, wait_until='domcontentloaded')
             await asyncio.sleep(3)
 
@@ -2445,7 +2449,7 @@ async def _extract_central_series(app: Application, chat_id: int, series_url: st
                 )
                 extraction_type = episode.get('content_type') or 'serie'
                 _stream, _title, _referer, _cookies, source_url = await get_stream_url(
-                    episode['url'], extraction_type
+                    episode['url'], extraction_type, source_only=True
                 )
                 if not _central_source_url_is_valid(source_url, episode['url']):
                     raise RuntimeError(f"Keine gültige VOE-/Doodstream-URL für {title}")
@@ -2497,7 +2501,7 @@ async def _extract_central_single(
         is_fp = _is_filmpalast_film(page_url) or _is_filmpalast_series(page_url)
         extraction_type = 'filmpalast' if is_fp else selected_type
         _stream, detected_title, _referer, _cookies, source_url = await get_stream_url(
-            page_url, extraction_type
+            page_url, extraction_type, source_only=True
         )
         if not _central_source_url_is_valid(source_url, page_url):
             raise RuntimeError("Keine gültige VOE-/Doodstream-URL gefunden")
