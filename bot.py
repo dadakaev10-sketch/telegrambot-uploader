@@ -144,6 +144,7 @@ logging.info(f"Telethon-Session: {_TG_SESSION_NAME}.session")
 
 MAIN_MENU = ReplyKeyboardMarkup(
     [
+        ["☁️ Remote Queue"],
         ["🆕 Megakino Last Added", "🆕 HDFilme Latest"],
         ["🆕 Filmpalast Import"],
         ["🔍 Watchcheck", "📋 Queue"],
@@ -2350,8 +2351,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _central_source_url_is_valid(source_url: str | None, page_url: str) -> bool:
+    if not source_url or not source_url.startswith(('http://', 'https://')):
+        return False
+    return source_url.rstrip('/') != page_url.rstrip('/')
+
+
 async def _extract_central_series(app: Application, chat_id: int, series_url: str) -> None:
-    msg = await app.bot.send_message(chat_id, "🔎 Lese SerienStream-Folgen …")
+    msg = await app.bot.send_message(chat_id, "🔎 Lese Staffeln und Folgen …")
     try:
         series_title, episodes = await get_series_episodes(series_url, False)
         missing = [ep for ep in episodes if not ep.get('skip')]
@@ -2368,14 +2375,15 @@ async def _extract_central_series(app: Application, chat_id: int, series_url: st
                 "Downloads starten erst, wenn alle Links gesammelt sind.",
                 parse_mode='Markdown',
             )
-            _stream, _title, _referer, _cookies, voe_url = await get_stream_url(
-                episode['url'], 'serie'
+            extraction_type = episode.get('content_type') or 'serie'
+            _stream, _title, _referer, _cookies, source_url = await get_stream_url(
+                episode['url'], extraction_type
             )
-            if not voe_url or '/e/' not in voe_url or _is_seriesstream_url(voe_url):
-                raise RuntimeError(f"Keine gültige VOE-Embed-URL für {title}")
+            if not _central_source_url_is_valid(source_url, episode['url']):
+                raise RuntimeError(f"Keine gültige VOE-/Doodstream-URL für {title}")
             jobs.append({
                 'type': 'video',
-                'url': voe_url,
+                'url': source_url,
                 'content_type': 'serie',
                 'manual_title': title,
                 'is_anime': False,
@@ -2396,6 +2404,100 @@ async def _extract_central_series(app: Application, chat_id: int, series_url: st
             f"❌ Extraktion abgebrochen: {error}\n\n"
             "Es wurde kein unvollständiger Satz an die zentrale Queue freigegeben."
         )
+
+
+async def _extract_central_single(
+    app: Application, chat_id: int, page_url: str, selected_type: str
+) -> None:
+    msg = await app.bot.send_message(chat_id, "🦊 Extrahiere Player-Link …")
+    try:
+        is_fp = _is_filmpalast_film(page_url) or _is_filmpalast_series(page_url)
+        extraction_type = 'filmpalast' if is_fp else selected_type
+        _stream, detected_title, _referer, _cookies, source_url = await get_stream_url(
+            page_url, extraction_type
+        )
+        if not _central_source_url_is_valid(source_url, page_url):
+            raise RuntimeError("Keine gültige VOE-/Doodstream-URL gefunden")
+
+        db_type = 'serie' if selected_type == 'serie' else 'film'
+        title = detected_title
+        if not title:
+            slug = page_url.rstrip('/').split('/')[-1]
+            title = slug.removesuffix('.html').replace('-', ' ').strip().title()
+        title = format_filename(title)
+        payload = {
+            'type': 'video',
+            'url': source_url,
+            'content_type': db_type,
+            'manual_title': title,
+            'is_anime': False,
+            'chat_id': chat_id,
+        }
+        result = await asyncio.to_thread(_central_queue.enqueue_many, [payload])
+        await msg.edit_text(
+            f"✅ In zentrale Queue gestellt\n`{title}`\n"
+            f"☁️ Neu: {result['created']} · Bereits vorhanden: {result['existing']}",
+            parse_mode='Markdown',
+        )
+    except Exception as error:
+        logging.error("Zentrale Einzel-Extraktion fehlgeschlagen:\n%s", traceback.format_exc())
+        await msg.edit_text(f"❌ Player-Extraktion fehlgeschlagen: {error}")
+
+
+async def _start_central_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str) -> None:
+    chat_id = update.effective_chat.id
+    if not _central_queue:
+        await update.message.reply_text("❌ `DATABASE_URL` fehlt.", parse_mode='Markdown')
+        return
+
+    url = _normalize_seriesstream_url(url.strip())
+    if re.search(r'megakino\d*\.(?:to|org|net|club|biz)', url, re.I):
+        context.user_data['central_pending_url'] = url
+        await update.message.reply_text(
+            "Ist der Megakino-Link ein Film oder eine Serie?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🎬 Film", callback_data="central_type_film"),
+                InlineKeyboardButton("📺 Serie", callback_data="central_type_serie"),
+            ]]),
+        )
+        return
+
+    if _is_seriesstream_url(url):
+        if '/episode-' in url:
+            _spawn_task(_extract_central_single(context.application, chat_id, url, 'serie'), f'central-single-{chat_id}')
+        else:
+            _spawn_task(_extract_central_series(context.application, chat_id, url), f'central-series-{chat_id}')
+        await update.message.reply_text("☁️ Extraktion für die Remote Queue gestartet.")
+        return
+
+    if _is_filmpalast_series(url):
+        _spawn_task(_extract_central_single(context.application, chat_id, url, 'serie'), f'central-single-{chat_id}')
+    elif _is_filmpalast_film(url):
+        _spawn_task(_extract_central_single(context.application, chat_id, url, 'film'), f'central-single-{chat_id}')
+    else:
+        context.user_data['central_pending_url'] = url
+        await update.message.reply_text(
+            "Film oder Serie?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🎬 Film", callback_data="central_type_film"),
+                InlineKeyboardButton("📺 Serie", callback_data="central_type_serie"),
+            ]]),
+        )
+
+
+async def handle_central_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    url = context.user_data.pop('central_pending_url', None)
+    if not url:
+        await query.edit_message_text("❌ URL-Auswahl ist abgelaufen. Bitte erneut starten.")
+        return
+    selected_type = 'serie' if query.data == 'central_type_serie' else 'film'
+    await query.edit_message_text(f"☁️ {selected_type.title()} wird für Remote Queue vorbereitet …")
+    if selected_type == 'serie':
+        _spawn_task(_extract_central_series(context.application, query.message.chat_id, url), f'central-series-{query.message.chat_id}')
+    else:
+        _spawn_task(_extract_central_single(context.application, query.message.chat_id, url, 'film'), f'central-film-{query.message.chat_id}')
 
 
 async def cmd_centralserie(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2429,6 +2531,19 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
+    if text == "☁️ Remote Queue":
+        context.user_data['central_waiting_url'] = True
+        await update.message.reply_text(
+            "☁️ Bitte sende jetzt die SerienStream-, Filmpalast- oder Megakino-URL."
+        )
+        return
+    if context.user_data.pop('central_waiting_url', False):
+        if not text.startswith(('http://', 'https://')):
+            context.user_data['central_waiting_url'] = True
+            await update.message.reply_text("❌ Bitte eine vollständige URL senden.")
+            return
+        await _start_central_url(update, context, text)
+        return
     if text == "▶️ Start":
         await cmd_start(update, context)
         return
@@ -5111,6 +5226,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(handle_serie_type, pattern="^serie_type_"))
     app.add_handler(CallbackQueryHandler(handle_reupload, pattern="^reupload_"))
     app.add_handler(CallbackQueryHandler(handle_cancel_queue, pattern="^cancel_queue_"))
+    app.add_handler(CallbackQueryHandler(handle_central_type, pattern="^central_type_"))
 
     print("🤖 Bot läuft!")
     print("Link senden → Film / Serie / Anime wählen → fertig")

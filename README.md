@@ -72,3 +72,8 @@ Während der Extraktion wird noch kein Job veröffentlicht. Erst wenn alle
 VOE-Links erfolgreich gesammelt wurden, schreibt der Bot sie gemeinsam in
 einer PostgreSQL-Transaktion in die zentrale Queue. Ein Remote-Bot mit
 `CENTRAL_QUEUE_ROLE=worker` beginnt deshalb erst danach mit dem Download.
+
+Alternativ im Telegram-Menü auf **☁️ Remote Queue** tippen und anschließend
+eine SerienStream-, Filmpalast- oder Megakino-URL senden. Bei Megakino fragt
+der Bot zusätzlich nach Film oder Serie. In PostgreSQL werden ausschließlich
+die aufgelösten Player-Links, zum Beispiel VOE oder Doodstream, gespeichert.
