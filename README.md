@@ -28,6 +28,10 @@ Bot starten:
 ./venv/bin/python bot.py
 ```
 
+Das Setup erstellt außerdem `~/Applications/Telegrambot Uploader.app`. Diese App
+kann per Doppelklick gestartet oder in das Dock gezogen werden. Sie öffnet ein
+Terminalfenster mit dem Bot-Log und verhindert einen zweiten gleichzeitigen Start.
+
 Der automatische Watchcheck ist deaktiviert. Er wird ausschließlich über den Button
 `Watchcheck` oder den Befehl `/watchcheck` gestartet.
 

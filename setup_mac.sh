@@ -64,8 +64,12 @@ ffmpeg -version >/dev/null
 ffprobe -version >/dev/null
 ./venv/bin/yt-dlp --version >/dev/null
 
+info "macOS-App-Launcher erstellen"
+./build_mac_app.sh
+
 printf '\n✅ Installation erfolgreich.\n%s\n' "$ENV_STATUS"
 printf '%s\n' "Danach bei Bedarf eine eigene Telethon-Session erstellen:"
 printf '%s\n' "  ./venv/bin/python create_session.py"
 printf '%s\n' "Bot starten:"
 printf '%s\n' "  ./venv/bin/python bot.py"
+printf '%s\n' "Oder per App: ~/Applications/Telegrambot Uploader.app"
