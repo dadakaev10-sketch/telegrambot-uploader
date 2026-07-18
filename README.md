@@ -31,3 +31,30 @@ Button `Watchcheck` oder `/watchcheck` geprüft.
 
 Lokale Zugangsdaten, Sessions, Queue, Watchlist, Datenbanken, Downloads und Logs
 werden nicht über GitHub übertragen.
+# Zentrale PostgreSQL-Queue
+
+Die GitHub-Version kann Eingabe und Download auf zwei Rechner verteilen. Die
+Jobs liegen dann in PostgreSQL; `FOR UPDATE SKIP LOCKED` stellt sicher, dass ein
+Job nur von einem Worker gleichzeitig reserviert wird.
+
+Auf dem Bot, dem du fertige VOE-Links sendest:
+
+```env
+CENTRAL_QUEUE_ROLE=producer
+RUN_TELEGRAM_POLLING=true
+```
+
+Auf dem Remote-Laptop, der herunterladen und hochladen soll:
+
+```env
+CENTRAL_QUEUE_ROLE=worker
+CENTRAL_QUEUE_WORKER_ID=remote-macbook-1
+RUN_TELEGRAM_POLLING=false
+```
+
+Beide Geräte verwenden dieselbe `DATABASE_URL`, aber weiterhin eigene
+`BOT_TOKEN`- und `TELETHON_SESSION`-Werte. Der Worker fragt PostgreSQL alle fünf
+Sekunden ab. Fehlgeschlagene Jobs werden mit wachsendem Abstand wieder
+freigegeben; dauerhaft gelöschte Medien landen im Status `dead`. Nach einem
+Worker-Absturz kann ein reservierter Job nach Ablauf der Lease von einem
+anderen Worker übernommen werden.

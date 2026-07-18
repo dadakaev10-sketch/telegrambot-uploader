@@ -59,7 +59,7 @@ fi
 
 info "Installation prüfen"
 ./venv/bin/python -m pip check
-./venv/bin/python -m py_compile bot.py central_media_db.py create_session.py
+./venv/bin/python -m py_compile bot.py central_media_db.py central_queue.py create_session.py
 ffmpeg -version >/dev/null
 ffprobe -version >/dev/null
 ./venv/bin/yt-dlp --version >/dev/null

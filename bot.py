@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import os, re, logging, subprocess, requests, asyncio, platform, json, sqlite3, sys, traceback, ast
+import os, re, logging, subprocess, requests, asyncio, platform, json, sqlite3, sys, traceback, ast, socket, uuid
 
 # Windows cp1252 kann keine Emojis → UTF-8 erzwingen
 if sys.stdout.encoding and sys.stdout.encoding.lower().replace('-','') != 'utf8':
@@ -22,6 +22,7 @@ from telegram.ext import Application, MessageHandler, CallbackQueryHandler, Comm
 from telethon import TelegramClient
 from camoufox.async_api import AsyncCamoufox
 from central_media_db import CentralMediaDB
+from central_queue import CentralQueue
 
 # ─── Config aus .env laden ────────────────────────
 load_dotenv()
@@ -41,6 +42,19 @@ WATCHLIST_FILE = os.path.join(DOWNLOAD_DIR, 'watchlist.json')
 DB_PATH       = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'media.db')
 DATABASE_URL  = os.getenv('DATABASE_URL', '').strip()
 _central_media_db = CentralMediaDB(DATABASE_URL) if DATABASE_URL else None
+CENTRAL_QUEUE_ROLE = os.getenv('CENTRAL_QUEUE_ROLE', 'local').strip().lower()
+if CENTRAL_QUEUE_ROLE not in ('local', 'producer', 'worker'):
+    raise ValueError("CENTRAL_QUEUE_ROLE muss local, producer oder worker sein")
+if CENTRAL_QUEUE_ROLE != 'local' and not DATABASE_URL:
+    raise ValueError("DATABASE_URL wird für die zentrale Queue benötigt")
+_central_queue = CentralQueue(
+    DATABASE_URL,
+    int(os.getenv('CENTRAL_QUEUE_LEASE_SECONDS', '7200')),
+) if CENTRAL_QUEUE_ROLE != 'local' else None
+CENTRAL_QUEUE_WORKER_ID = (
+    os.getenv('CENTRAL_QUEUE_WORKER_ID', '').strip()
+    or f'{socket.gethostname()}-{uuid.uuid4().hex[:8]}'
+)
 RUN_TELEGRAM_POLLING = os.getenv('RUN_TELEGRAM_POLLING', 'true').lower() in ('1', 'true', 'yes', 'on')
 # camoufox läuft headless (kein Fenster pro Folge). Falls ALTCHA/VOE mal hängt,
 # SERIENSTREAM_HEADFUL=1 setzen → Browser wird sichtbar (zur Diagnose/Edge-Case).
@@ -3724,6 +3738,18 @@ async def _enqueue(chat_id: int, msg, coro_func, persist: dict, *coro_args,
         _watchlist_add('series', persist['url'], chat_id, persist.get('is_anime', False))
     elif persist.get('type') == 'bulk_films':
         _watchlist_add('bulk_films', persist['url'], chat_id, False)
+
+    # Producer-Bots schreiben nur nach PostgreSQL. Sie laden selbst nichts und
+    # verändern ihre lokale queue.json nicht. Worker-Jobs tragen bereits eine
+    # Claim-ID und werden deshalb nicht erneut veröffentlicht.
+    if CENTRAL_QUEUE_ROLE == 'producer' and not persist.get('_central_job_id'):
+        job_id, created = await asyncio.to_thread(_central_queue.enqueue, persist)
+        label = _queue_item_label(persist)
+        if created:
+            await msg.edit_text(f"☁️ Zentrale Queue #{job_id}: {label}")
+        else:
+            await msg.edit_text(f"ℹ️ Bereits in zentraler Queue #{job_id}: {label}")
+        return
     item = {
         'chat_id': chat_id, 'msg': msg, 'coro': coro_func,
         'args': (msg,) + coro_args, 'persist': persist,
@@ -3754,6 +3780,19 @@ async def _requeue_failed_after(item: dict, delay: int) -> None:
         "Fehlgeschlagener Queue-Eintrag wieder hinten eingereiht: %s",
         _queue_item_label(item.get('persist', {})),
     )
+
+
+async def _central_job_heartbeat(job_id: int) -> None:
+    """Hält lange Downloads reserviert, damit kein zweiter Worker sie übernimmt."""
+    interval = max(30, int(os.getenv('CENTRAL_QUEUE_HEARTBEAT_SECONDS', '60')))
+    while True:
+        await asyncio.sleep(interval)
+        renewed = await asyncio.to_thread(
+            _central_queue.heartbeat, job_id, CENTRAL_QUEUE_WORKER_ID
+        )
+        if not renewed:
+            logging.warning("Lease für zentralen Job #%s konnte nicht verlängert werden", job_id)
+            return
 
 
 def _archive_dead_job(persist: dict, reason: str) -> None:
@@ -3790,11 +3829,21 @@ async def _dl_worker():
             logging.info(f"[SKIP-PREFLIGHT] Bereits in DB: {label}")
             if item in _dl_pending:
                 _dl_pending.remove(item)
+            central_job_id = item.get('persist', {}).get('_central_job_id')
+            if central_job_id:
+                await asyncio.to_thread(
+                    _central_queue.complete, central_job_id, CENTRAL_QUEUE_WORKER_ID
+                )
             _persist_queue('preflight-already-done')
             _dl_queue.task_done()
             continue
 
         _dl_active = item
+        central_job_id = item.get('persist', {}).get('_central_job_id')
+        heartbeat_task = (
+            _spawn_task(_central_job_heartbeat(central_job_id), f'central-heartbeat-{central_job_id}')
+            if central_job_id else None
+        )
         print(f"[WORKER] Starte: {item['coro'].__name__}", flush=True)
         succeeded = False
         permanent_failure = False
@@ -3816,6 +3865,8 @@ async def _dl_worker():
             except Exception:
                 pass
         finally:
+            if heartbeat_task:
+                heartbeat_task.cancel()
             _dl_active = None
             if permanent_failure:
                 persist = item.get('persist', {})
@@ -3825,10 +3876,22 @@ async def _dl_worker():
                 _archive_dead_job(persist, failure_text or 'Dauerhaft nicht verfügbar')
                 if item in _dl_pending:
                     _dl_pending.remove(item)
+                if persist.get('_central_job_id'):
+                    await asyncio.to_thread(
+                        _central_queue.dead,
+                        persist['_central_job_id'], CENTRAL_QUEUE_WORKER_ID,
+                        failure_text or 'Dauerhaft nicht verfügbar',
+                    )
                 _persist_queue('permanent-failure-archived')
                 logging.warning("Dauerhaft entfernten Job archiviert: %s", _queue_item_label(persist))
             elif succeeded and item in _dl_pending:
                 _dl_pending.remove(item)
+                persist = item.get('persist', {})
+                if persist.get('_central_job_id'):
+                    await asyncio.to_thread(
+                        _central_queue.complete,
+                        persist['_central_job_id'], CENTRAL_QUEUE_WORKER_ID,
+                    )
                 _persist_queue('completed')
             elif not succeeded:
                 persist = item.get('persist', {})
@@ -3838,6 +3901,21 @@ async def _dl_worker():
                 item['failed'] = True
                 delay = _failed_retry_delay(persist['failure_count'])
                 persist['retry_delay_seconds'] = delay
+                if persist.get('_central_job_id'):
+                    await asyncio.to_thread(
+                        _central_queue.retry,
+                        persist['_central_job_id'], CENTRAL_QUEUE_WORKER_ID,
+                        persist['last_error'], delay,
+                    )
+                    if item in _dl_pending:
+                        _dl_pending.remove(item)
+                    _persist_queue('central-failed-released')
+                    logging.error(
+                        "Zentraler Queue-Eintrag #%s in %ss erneut verfügbar: %s",
+                        persist['_central_job_id'], delay, _queue_item_label(persist),
+                    )
+                    _dl_queue.task_done()
+                    continue
                 _persist_queue('failed-retained')
                 retry_task = _spawn_task(
                     _requeue_failed_after(item, delay),
@@ -3888,6 +3966,20 @@ def _queue_item_already_done(persist: dict) -> bool:
 
 async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Zeigt aktuelle Warteschlange mit Abbrechen-Buttons."""
+    if CENTRAL_QUEUE_ROLE == 'producer':
+        jobs = await asyncio.to_thread(_central_queue.open_jobs)
+        if not jobs:
+            await update.message.reply_text("✅ Zentrale Warteschlange ist leer.")
+            return
+        lines = []
+        for job in jobs:
+            marker = '▶️' if job['status'] == 'processing' else '☁️'
+            lines.append(f"{marker} *#{job['id']}* {_queue_item_label(job['payload'])}")
+        await update.message.reply_text(
+            "📋 *Zentrale PostgreSQL-Warteschlange:*\n" + "\n".join(lines),
+            parse_mode='Markdown',
+        )
+        return
     if not _dl_pending:
         await update.message.reply_text("✅ Warteschlange ist leer.")
         return
@@ -4878,11 +4970,40 @@ async def _restore_queue_job(app: Application, item_data: dict) -> None:
         await _enqueue(chat_id, msg, process_video, item_data,
                        item_data['url'], item_data['content_type'],
                        item_data.get('manual_title'), item_data.get('is_anime', False), **common)
+
+
+async def _central_queue_worker(app: Application) -> None:
+    """Reserviert atomar genau einen PostgreSQL-Job für diesen Rechner."""
+    poll_seconds = max(1, int(os.getenv('CENTRAL_QUEUE_POLL_SECONDS', '5')))
+    while True:
+        try:
+            if not _dl_pending and _dl_active is None:
+                claimed = await asyncio.to_thread(
+                    _central_queue.claim, CENTRAL_QUEUE_WORKER_ID
+                )
+                if claimed:
+                    payload = dict(claimed['payload'])
+                    payload['_central_job_id'] = claimed['id']
+                    payload['_central_attempts'] = claimed['attempts']
+                    logging.info(
+                        "Zentralen Queue-Job #%s reserviert (Versuch %s)",
+                        claimed['id'], claimed['attempts'],
+                    )
+                    await _restore_queue_job(app, payload)
+                    continue
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.error("Central-Queue-Polling Fehler:\n%s", traceback.format_exc())
+        await asyncio.sleep(poll_seconds)
 # ─── Main ────────────────────────────────────────
 
 async def main():
     print("[DEBUG] main() gestartet")
     _db_init()
+    if _central_queue:
+        await asyncio.to_thread(_central_queue.init)
+        logging.info("Zentrale PostgreSQL-Queue aktiv: Rolle=%s", CENTRAL_QUEUE_ROLE)
     print("[DEBUG] DB initialisiert")
     _series_progress.update(_load_progress())
     _watchlist.extend(_load_watchlist())
@@ -4934,7 +5055,7 @@ async def main():
         ])
         _spawn_task(_dl_worker(), "download-worker")
 
-        saved = _load_queue()
+        saved = _load_queue() if CENTRAL_QUEUE_ROLE == 'local' else []
         if saved:
             logging.info(f"Queue-Wiederherstellung: {len(saved)} lokale Einträge")
         for item_data in saved:
@@ -4942,6 +5063,9 @@ async def main():
                 await _restore_queue_job(app, item_data)
             except Exception as e:
                 logging.error(f"Queue-Wiederherstellung Fehler: {e}")
+
+        if CENTRAL_QUEUE_ROLE == 'worker':
+            _spawn_task(_central_queue_worker(app), "central-queue-worker")
 
         if RUN_TELEGRAM_POLLING:
             _spawn_task(_polling_watchdog(app), "telegram-polling-watchdog")
