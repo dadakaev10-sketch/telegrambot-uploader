@@ -2414,26 +2414,29 @@ async def _extract_central_series(app: Application, chat_id: int, series_url: st
         deferred_total = 0
         for season, season_episodes in sorted(seasons.items()):
             season_episodes.sort(key=lambda ep: int(ep.get('episode', 0)))
-            season_total = len(season_episodes)
             source_key = f"series:{series_url.rstrip('/').lower()}:season:{season}"
             batch_title = f"{series_title} – Staffel {season}"
+            released_titles = await asyncio.to_thread(
+                _central_queue.released_job_titles, source_key
+            )
+            season_episodes = [
+                episode for episode in season_episodes
+                if episode['title'] not in released_titles
+            ]
+            if not season_episodes:
+                completed_seasons += 1
+                await msg.edit_text(
+                    f"⏭ *{batch_title}* ist bereits in der Remote Queue\n"
+                    f"📚 Staffeln geprüft: {completed_seasons}/{len(seasons)}",
+                    parse_mode='Markdown',
+                )
+                continue
+            season_total = len(season_episodes)
             batch = await asyncio.to_thread(
                 _central_queue.get_or_create_batch,
                 source_key, batch_title, series_url, chat_id, season_total,
             )
             batch_id = batch['id']
-            if batch.get('status') == 'ready':
-                completed_seasons += 1
-                logging.info(
-                    "Central-Batch #%s bereits freigegeben, Staffel %s wird nicht erneut extrahiert",
-                    batch_id, season,
-                )
-                await msg.edit_text(
-                    f"⏭ *{batch_title}* ist bereits vollständig in der Remote Queue\n"
-                    f"📚 Staffeln abgeschlossen: {completed_seasons}/{len(seasons)}",
-                    parse_mode='Markdown',
-                )
-                continue
             stored_titles = await asyncio.to_thread(_central_queue.batch_job_titles, batch_id)
             stored_count = len(stored_titles)
 
@@ -2483,26 +2486,34 @@ async def _extract_central_series(app: Application, chat_id: int, series_url: st
                     )
                     continue
 
-            if stored_count < season_total:
+            missing_after_pass = season_total - stored_count
+            if stored_count == 0:
                 incomplete_seasons += 1
                 logging.warning(
-                    "Central-Batch #%s bleibt offen: %s/%s Links gespeichert",
-                    batch_id, stored_count, season_total,
+                    "Central-Batch #%s bleibt offen: kein Link von %s gespeichert",
+                    batch_id, season_total,
                 )
                 await msg.edit_text(
                     f"🧩 *{batch_title}* bleibt offen\n"
-                    f"💾 {stored_count}/{season_total} Links gespeichert\n"
-                    f"⏭ {season_total - stored_count} Folge(n) werden später erneut versucht.",
+                    f"⏭ Alle {season_total} Folge(n) werden später erneut versucht.",
                     parse_mode='Markdown',
                 )
                 continue
+
+            if missing_after_pass > 0:
+                incomplete_seasons += 1
+                logging.warning(
+                    "Central-Batch #%s wird teilweise freigegeben: %s/%s Links gespeichert",
+                    batch_id, stored_count, season_total,
+                )
 
             released = await asyncio.to_thread(_central_queue.release_batch, batch_id)
             released_total += released
             completed_seasons += 1
             await msg.edit_text(
-                f"✅ *{batch_title}* freigegeben\n"
+                f"{'✅' if missing_after_pass == 0 else '🧩'} *{batch_title}* freigegeben\n"
                 f"☁️ {released} Folgen sind für Remote bereit\n"
+                f"⏭ {missing_after_pass} Folge(n) werden später nachgereicht\n"
                 f"📚 Staffeln abgeschlossen: {completed_seasons}/{len(seasons)}",
                 parse_mode='Markdown',
             )
