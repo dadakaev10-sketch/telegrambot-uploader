@@ -17,6 +17,10 @@ Danach `.env` ausfüllen und eine eigene Telethon-Session erstellen:
 ./venv/bin/python create_session.py
 ```
 
+`ALLOWED_CHAT_IDS` muss die eigene Telegram-Chat-ID enthalten. Ohne diese
+Allowlist startet ein Bot mit aktivem Telegram-Polling absichtlich nicht. So
+können fremde Nutzer keine Links, Imports oder Watchchecks auslösen.
+
 Start per Terminal:
 
 ```bash

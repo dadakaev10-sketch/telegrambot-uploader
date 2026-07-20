@@ -18,7 +18,10 @@ def normalize_title(title: str) -> str:
     return re.sub(r'[\s:\-]+', ' ', title).strip().lower()
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ReplyKeyboardMarkup
 from telegram.error import BadRequest as TgBadRequest, RetryAfter as TgRetryAfter
-from telegram.ext import Application, MessageHandler, CallbackQueryHandler, CommandHandler, filters, ContextTypes
+from telegram.ext import (
+    Application, ApplicationHandlerStop, MessageHandler, CallbackQueryHandler,
+    CommandHandler, TypeHandler, filters, ContextTypes,
+)
 from telethon import TelegramClient
 from camoufox.async_api import AsyncCamoufox
 from central_media_db import CentralMediaDB
@@ -56,6 +59,19 @@ CENTRAL_QUEUE_WORKER_ID = (
     or f'{socket.gethostname()}-{uuid.uuid4().hex[:8]}'
 )
 RUN_TELEGRAM_POLLING = os.getenv('RUN_TELEGRAM_POLLING', 'true').lower() in ('1', 'true', 'yes', 'on')
+try:
+    ALLOWED_CHAT_IDS = {
+        int(value.strip())
+        for value in os.getenv('ALLOWED_CHAT_IDS', '').split(',')
+        if value.strip()
+    }
+except ValueError as error:
+    raise ValueError("ALLOWED_CHAT_IDS muss kommaseparierte Telegram-Chat-IDs enthalten") from error
+if RUN_TELEGRAM_POLLING and not ALLOWED_CHAT_IDS:
+    raise ValueError(
+        "Telegram-Polling ist aktiv, aber ALLOWED_CHAT_IDS fehlt. "
+        "Der Bot startet aus Sicherheitsgründen nicht öffentlich."
+    )
 # camoufox läuft headless (kein Fenster pro Folge). Falls ALTCHA/VOE mal hängt,
 # SERIENSTREAM_HEADFUL=1 setzen → Browser wird sichtbar (zur Diagnose/Edge-Case).
 SERIENSTREAM_HEADFUL = os.getenv('SERIENSTREAM_HEADFUL', '').lower() in ('1', 'true', 'yes', 'on')
@@ -5278,6 +5294,15 @@ async def _polling_watchdog(app: Application):
             await asyncio.sleep(15)
 
 
+async def _enforce_chat_allowlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stoppt sämtliche Commands, Nachrichten und Buttons fremder Chats."""
+    chat = update.effective_chat
+    if chat is None or chat.id in ALLOWED_CHAT_IDS:
+        return
+    logging.warning("Telegram-Update von nicht freigegebenem Chat verworfen")
+    raise ApplicationHandlerStop
+
+
 async def _restore_queue_job(app: Application, item_data: dict) -> None:
     chat_id = item_data.get('chat_id')
     if not chat_id:
@@ -5356,6 +5381,9 @@ async def main():
         .pool_timeout(30.0)      # Warten auf freien HTTP-Pool-Slot
         .build()
     )
+    # Gruppe -1 läuft zwingend vor allen normalen Handlern. Ein fremder Chat
+    # erreicht dadurch weder Link-Queue noch Import-, Watchcheck- oder Buttons.
+    app.add_handler(TypeHandler(Update, _enforce_chat_allowlist), group=-1)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(CommandHandler("watchcheck", cmd_watchcheck))
