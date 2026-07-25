@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import os, re, logging, subprocess, requests, asyncio, platform, json, sqlite3, sys, traceback, ast, socket, uuid
+import os, re, logging, subprocess, requests, asyncio, platform, json, sqlite3, sys, traceback, ast, socket, uuid, time as _time
 from contextlib import asynccontextmanager
 
 # Windows cp1252 kann keine Emojis → UTF-8 erzwingen
@@ -2907,6 +2907,7 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
     _is_fp_serie = is_filmpalast and bool(re.search(r'-s\d{2}e\d{2}', url, re.IGNORECASE))
 
     filename = None
+    keep_downloaded_file = False
     try:
         # Vorläufiger Titel (für Serie/Anime oder wenn manuell gesetzt)
         if manual_title:
@@ -3017,7 +3018,6 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
             await msg.edit_text(f"📥 Lade herunter...\n`{filename}`", parse_mode='Markdown')
 
             # Progress-Monitor: alle 5s Dateigröße in Telegram updaten
-            import time as _time
             dl_start = _time.monotonic()
             stop_progress = asyncio.Event()
             _dl_status.update({'filename': filename, 'start': dl_start, 'size_mb': 0, 'phase': 'download'})
@@ -3069,6 +3069,9 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
                 return False
 
         filepath = await downscale_if_needed(filepath, msg)
+        # Ab hier liegt eine fertige Datei vor. Bei Telegram-/Netzwerkfehlern
+        # behalten, damit der nächste Queue-Versuch nicht erneut herunterladen muss.
+        keep_downloaded_file = True
 
         size_mb = os.path.getsize(filepath) / (1024 * 1024)
         _dl_status.update({'phase': 'upload', 'size_mb': size_mb, 'elapsed': int(_time.monotonic() - _dl_status.get('start', _time.monotonic()))})
@@ -3078,6 +3081,7 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
         caption = build_caption(filename, 'serie' if _is_fp_serie else content_type)
         await upload_with_telethon(filepath, caption, msg, progress_prefix=progress_prefix)
         _db_add(_db_ct, filename, is_anime, overwrite=(overwrite or update_due_to_new_source), voe_url=source_voe_url)
+        keep_downloaded_file = False
         await msg.edit_text(f"✅ Fertig!\n`{filename}.mp4`", parse_mode='Markdown')
         return True
 
@@ -3089,13 +3093,19 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
             pass
         return PERMANENT_JOB_FAILURE
     except Exception as e:
-        tb = traceback.format_exc()[-1500:]
-        await msg.edit_text(f"❌ Fehler: {str(e)}\n\n🔍 Debug:\n```\n{tb}\n```", parse_mode='Markdown')
-        logging.error(f"process_video Fehler:\n{traceback.format_exc()}")
+        full_tb = traceback.format_exc()
+        logging.error(f"process_video Fehler:\n{full_tb}")
+        # Kein Markdown: Tracebacks enthalten häufig Zeichen, die Telegrams
+        # Entity-Parser als unvollständige Formatierung interpretiert.
+        error_text = f"❌ Fehler: {e}\n\n🔍 Debug:\n{full_tb[-2500:]}"
+        try:
+            await msg.edit_text(error_text)
+        except Exception as notify_error:
+            logging.warning(f"Telegram-Fehlermeldung konnte nicht gesendet werden: {notify_error}")
         return False
     finally:
         fp = os.path.join(DOWNLOAD_DIR, f"{filename}.mp4") if filename else None
-        if fp and os.path.exists(fp):
+        if fp and os.path.exists(fp) and not keep_downloaded_file:
             os.remove(fp)
 
 
