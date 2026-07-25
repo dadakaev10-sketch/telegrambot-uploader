@@ -1,7 +1,9 @@
-# Telegrambot Camoufox
+# Telegrambot Uploader
 
 Telegram-Uploader mit lokaler Queue, gemeinsamem PostgreSQL-Medienbestand und
-Camoufox als Browser-Backend.
+Getrennte Browser-Backends: Camoufox wird ausschließlich für SerienStream
+verwendet. Filmpalast, Megakino, AniWorld und Browser-Downloads laufen über
+Playwright Chromium.
 
 ## Installation auf einem Mac
 

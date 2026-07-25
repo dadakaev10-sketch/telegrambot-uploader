@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import os, re, logging, subprocess, requests, asyncio, platform, json, sqlite3, sys, traceback, ast, socket, uuid
+from contextlib import asynccontextmanager
 
 # Windows cp1252 kann keine Emojis → UTF-8 erzwingen
 if sys.stdout.encoding and sys.stdout.encoding.lower().replace('-','') != 'utf8':
@@ -24,6 +25,7 @@ from telegram.ext import (
 )
 from telethon import TelegramClient
 from camoufox.async_api import AsyncCamoufox
+from playwright.async_api import async_playwright
 from central_media_db import CentralMediaDB
 from central_queue import CentralQueue
 
@@ -491,6 +493,26 @@ def format_filename(title: str) -> str:
 
 # ─── Stream & Download ───────────────────────────
 
+@asynccontextmanager
+async def _open_browser(*, camoufox: bool, headless: bool = True):
+    """Öffnet Camoufox nur für SerienStream, sonst Playwright Chromium."""
+    if camoufox:
+        async with AsyncCamoufox(headless=headless) as browser:
+            yield browser
+        return
+
+    async with async_playwright() as playwright:
+        launch_options = {'headless': headless}
+        if platform.system() == 'Linux':
+            launch_options['args'] = ['--no-sandbox', '--disable-dev-shm-usage']
+        browser = await playwright.chromium.launch(**launch_options)
+        try:
+            yield browser
+        finally:
+            if browser.is_connected():
+                await browser.close()
+
+
 async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
                          source_only: bool = False) -> tuple[str | None, str | None, str | None, str, str | None]:
     """Playwright öffnet URL, extrahiert ggf. iframe-URL, klickt Play, fängt Stream ab.
@@ -505,7 +527,16 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
     cookie_str = ""
     source_voe_url = None  # zum DB-Vergleich (erkennt Re-Uploads in besserer Qualität)
 
-    async with AsyncCamoufox(headless=not SERIENSTREAM_HEADFUL) as browser:
+    use_camoufox = _is_seriesstream_url(page_url)
+    logging.info(
+        "Browser-Backend: %s für %s",
+        "Camoufox" if use_camoufox else "Playwright Chromium",
+        page_url,
+    )
+    async with _open_browser(
+        camoufox=use_camoufox,
+        headless=not SERIENSTREAM_HEADFUL if use_camoufox else True,
+    ) as browser:
         # ALTCHA rechnet den Proof-of-Work im sichtbaren Browser zuverlässig aus;
         # camoufox löst das auch headless → kein Fenster pro Folge. Bei Problemen
         # SERIENSTREAM_HEADFUL=1 setzen, dann läuft der Browser sichtbar.
@@ -1184,7 +1215,7 @@ async def download_with_browser(stream_url: str, filepath: str, referer: str | N
     logging.info(f"Browser-Download startet: {stream_url[:120]}")
     import time as _time
 
-    async with AsyncCamoufox(headless=True) as browser:
+    async with _open_browser(camoufox=False) as browser:
 
         cookies_for_context = []
         if cookie_str and referer:
@@ -2048,7 +2079,7 @@ async def get_series_episodes(series_url: str, is_anime: bool = False) -> tuple[
             logging.info(f"Serie: {skip_count}/{len(episodes)} Folgen bereits vorhanden → werden übersprungen")
         return series_title, episodes
 
-    async with AsyncCamoufox(headless=True) as browser:
+    async with _open_browser(camoufox=False) as browser:
         context = await browser.new_context()
         page = await context.new_page()
 
@@ -3168,7 +3199,7 @@ async def get_bulk_films_from_page(listing_url: str) -> list[dict]:
     """Scrapet alle Filmlinks von einer megakino1.club Listing-Seite."""
     print(f"[BULK] Playwright startet für: {listing_url}", flush=True)
     logging.info(f"Bulk-Filme: Lade Seite {listing_url}")
-    async with AsyncCamoufox(headless=True) as browser:
+    async with _open_browser(camoufox=False) as browser:
         context = await browser.new_context()
         page = await context.new_page()
         print("[BULK] Browser geöffnet, lade Seite...", flush=True)
@@ -3344,7 +3375,7 @@ def _parse_megakino_last_added_html(html: str, base_url: str) -> list[dict]:
 
 async def get_megakino_last_added(home_url: str = MEGAKINO_HOME_URL) -> list[dict]:
     logging.info(f"Megakino Last Added: Lade Startseite {home_url}")
-    async with AsyncCamoufox(headless=True) as browser:
+    async with _open_browser(camoufox=False) as browser:
         context = await browser.new_context()
         page = await context.new_page()
         await page.goto(home_url, timeout=60000, wait_until='domcontentloaded')
@@ -3579,7 +3610,7 @@ def _kinoger_best_quality_height(embed_url: str) -> int | None:
 async def _kinoger_resolve_browser_media(embed_url: str, preferred_qualities: tuple[str, ...] = ('720p', '1080p', '360p')) -> str | None:
     """Resolve the short-lived playback URL that incvideo creates in a real browser."""
     try:
-        async with AsyncCamoufox(headless=True) as browser:
+        async with _open_browser(camoufox=False) as browser:
             context = await browser.new_context()
             page = await context.new_page()
             media_urls: list[str] = []

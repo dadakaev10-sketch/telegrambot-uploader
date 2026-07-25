@@ -46,6 +46,9 @@ info "Python-Werkzeuge und Bot-Abhängigkeiten installieren"
 ./venv/bin/python -m pip install --upgrade pip setuptools wheel
 ./venv/bin/python -m pip install --requirement requirements.txt
 
+info "Playwright Chromium für Filmpalast, Megakino, AniWorld und Downloads installieren"
+./venv/bin/python -m playwright install chromium
+
 info "camoufox-Browser (Firefox) installieren"
 ./venv/bin/python -m camoufox fetch
 

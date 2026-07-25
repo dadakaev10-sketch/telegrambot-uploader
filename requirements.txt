@@ -6,7 +6,7 @@ beautifulsoup4==4.12.2
 requests==2.31.0
 Telethon==1.37.0
 camoufox==0.5.4
-# camoufox nutzt Playwright als Backend (wird transitiv gezogen):
+# Eigenes Chromium-Backend für alle Quellen außer SerienStream:
 playwright==1.42.0
 psycopg[binary]==3.3.4
 yt-dlp==2026.7.4
@@ -30,4 +30,6 @@ typing_extensions==4.15.0
 urllib3==2.7.0
 
 # Zusätzlich als Systempakete erforderlich: ffmpeg und ffprobe.
-# Browser-Backend nach der Installation: python -m camoufox fetch
+# Browser installieren:
+#   python -m playwright install chromium
+#   python -m camoufox fetch
