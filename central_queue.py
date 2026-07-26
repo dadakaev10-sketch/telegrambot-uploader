@@ -105,6 +105,11 @@ class CentralQueue:
                 (key,),
             ).fetchone()
             if existing:
+                if int(clean_payload.get('priority', 0) or 0) > 0:
+                    con.execute(
+                        "UPDATE download_jobs SET payload=payload || %s::jsonb,updated_at=now() WHERE id=%s",
+                        (json.dumps({'priority': int(clean_payload['priority'])}), existing['id']),
+                    )
                 return existing['id'], False
             row = con.execute(
                 "INSERT INTO download_jobs(dedupe_key,payload) VALUES (%s,%s::jsonb) RETURNING id",
@@ -126,6 +131,11 @@ class CentralQueue:
                     (key,),
                 ).fetchone()
                 if row:
+                    if int(clean.get('priority', 0) or 0) > 0:
+                        con.execute(
+                            "UPDATE download_jobs SET payload=payload || %s::jsonb,updated_at=now() WHERE id=%s",
+                            (json.dumps({'priority': int(clean['priority'])}), row['id']),
+                        )
                     existing += 1
                     continue
                 con.execute(
@@ -204,6 +214,11 @@ class CentralQueue:
                 (key,),
             ).fetchone()
             if row:
+                if int(clean.get('priority', 0) or 0) > 0:
+                    con.execute(
+                        "UPDATE download_jobs SET payload=payload || %s::jsonb,updated_at=now() WHERE id=%s",
+                        (json.dumps({'priority': int(clean['priority'])}), row['id']),
+                    )
                 return row['id'], False
             row = con.execute(
                 "INSERT INTO download_jobs(dedupe_key,payload,batch_id) VALUES (%s,%s::jsonb,%s) RETURNING id",
@@ -223,6 +238,22 @@ class CentralQueue:
                 (batch_id,),
             )
             return count
+
+    def promote_source_jobs(self, source_key: str, priority: int = 100) -> int:
+        """Zieht alle wartenden Jobs eines Staffel-Batches nach vorne."""
+        with self.connect() as con:
+            result = con.execute(
+                """
+                UPDATE download_jobs AS job
+                SET payload=job.payload || %s::jsonb, updated_at=now()
+                FROM download_batches AS batch
+                WHERE job.batch_id=batch.id
+                  AND batch.source_key=%s
+                  AND job.status='queued'
+                """,
+                (json.dumps({'priority': int(priority)}), source_key),
+            )
+            return int(result.rowcount)
 
     def collecting_batches(self) -> list[dict]:
         with self.connect() as con:
@@ -248,7 +279,14 @@ class CentralQueue:
                                SELECT 1 FROM download_batches b WHERE b.id=download_jobs.batch_id AND b.status='ready'
                            )))
                        OR (status='processing' AND locked_at < now() - (%s * interval '1 second'))
-                    ORDER BY available_at, id
+                    ORDER BY
+                        CASE
+                            WHEN payload->>'priority' ~ '^[0-9]+$'
+                            THEN (payload->>'priority')::integer
+                            ELSE 0
+                        END DESC,
+                        available_at,
+                        id
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
                 )

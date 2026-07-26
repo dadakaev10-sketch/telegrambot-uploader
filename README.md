@@ -105,3 +105,8 @@ offenen PostgreSQL-Jobs entfernt – einschließlich `processing`-Jobs und noch
 nicht freigegebener Staffel-Entwürfe. Ein auf einem anderen Rechner bereits
 physisch gestarteter Download kann dort noch bis zum Abschluss oder nächsten
 Fehler weiterlaufen, ist danach aber kein offener PostgreSQL-Auftrag mehr.
+
+Mit **⚡ Serie vorreihen** wird die anschließend gesendete SerienStream-Serie
+mit hoher Priorität eingetragen. Ein bereits aktiver Download läuft zu Ende;
+danach werden die priorisierten Folgen vor allen normal wartenden Jobs
+reserviert.

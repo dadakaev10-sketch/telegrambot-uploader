@@ -184,6 +184,7 @@ logging.info(f"Telethon-Session: {_TG_SESSION_NAME}.session")
 MAIN_MENU = ReplyKeyboardMarkup(
     [
         ["▶️ Remote Queue Download", "🗑 Remote Queue leeren"],
+        ["⚡ Serie vorreihen"],
         ["🆕 Megakino Last Added", "🆕 HDFilme Latest"],
         ["🆕 Filmpalast Import"],
         ["🔍 Watchcheck", "📋 Queue"],
@@ -2463,8 +2464,11 @@ def _central_source_url_is_valid(source_url: str | None, page_url: str) -> bool:
     return source_url.rstrip('/') != page_url.rstrip('/')
 
 
-async def _extract_central_series(app: Application, chat_id: int, series_url: str) -> None:
-    msg = await app.bot.send_message(chat_id, "🔎 Lese Staffeln und Folgen …")
+async def _extract_central_series(
+    app: Application, chat_id: int, series_url: str, priority: int = 0
+) -> None:
+    prefix = "⚡ Priorisierte Serie\n" if priority else ""
+    msg = await app.bot.send_message(chat_id, prefix + "🔎 Lese Staffeln und Folgen …")
     try:
         series_title, episodes = await get_series_episodes(series_url, False)
         missing = [ep for ep in episodes if not ep.get('skip')]
@@ -2484,6 +2488,15 @@ async def _extract_central_series(app: Application, chat_id: int, series_url: st
             season_episodes.sort(key=lambda ep: int(ep.get('episode', 0)))
             source_key = f"series:{series_url.rstrip('/').lower()}:season:{season}"
             batch_title = f"{series_title} – Staffel {season}"
+            if priority:
+                promoted = await asyncio.to_thread(
+                    _central_queue.promote_source_jobs, source_key, priority
+                )
+                if promoted:
+                    logging.info(
+                        "Priorität für %s bestehende Jobs von %s gesetzt",
+                        promoted, batch_title,
+                    )
             released_titles = await asyncio.to_thread(
                 _central_queue.released_job_titles, source_key
             )
@@ -2551,6 +2564,7 @@ async def _extract_central_series(app: Application, chat_id: int, series_url: st
                             'manual_title': title,
                             'is_anime': False,
                             'chat_id': chat_id,
+                            'priority': priority,
                         }
                         _job_id, created = await asyncio.to_thread(
                             _central_queue.enqueue_batch_job, batch_id, payload
@@ -2634,7 +2648,8 @@ async def _extract_central_series(app: Application, chat_id: int, series_url: st
 
 
 async def _extract_central_single(
-    app: Application, chat_id: int, page_url: str, selected_type: str
+    app: Application, chat_id: int, page_url: str, selected_type: str,
+    priority: int = 0,
 ) -> None:
     msg = await app.bot.send_message(chat_id, "🦊 Extrahiere Player-Link …")
     try:
@@ -2659,6 +2674,7 @@ async def _extract_central_single(
             'manual_title': title,
             'is_anime': False,
             'chat_id': chat_id,
+            'priority': priority,
         }
         result = await asyncio.to_thread(_central_queue.enqueue_many, [payload])
         await msg.edit_text(
@@ -2671,7 +2687,9 @@ async def _extract_central_single(
         await msg.edit_text(f"❌ Player-Extraktion fehlgeschlagen: {error}")
 
 
-async def _start_central_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str) -> None:
+async def _start_central_url(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, priority: int = 0
+) -> None:
     chat_id = update.effective_chat.id
     if not _central_queue:
         await update.message.reply_text("❌ `DATABASE_URL` fehlt.", parse_mode='Markdown')
@@ -2686,10 +2704,19 @@ async def _start_central_url(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
 
     if '/episode-' in url:
-        _spawn_task(_extract_central_single(context.application, chat_id, url, 'serie'), f'central-single-{chat_id}')
+        _spawn_task(
+            _extract_central_single(
+                context.application, chat_id, url, 'serie', priority
+            ),
+            f'central-single-{chat_id}',
+        )
     else:
-        _spawn_task(_extract_central_series(context.application, chat_id, url), f'central-series-{chat_id}')
+        _spawn_task(
+            _extract_central_series(context.application, chat_id, url, priority),
+            f'central-series-{chat_id}',
+        )
     await update.message.reply_text(
+        ("⚡ Serie wird vor allen wartenden Jobs eingereiht.\n" if priority else "") +
         "🦊 Camoufox extrahiert nur die VOE-Links und legt sie in die Remote Queue."
     )
 
@@ -2813,6 +2840,13 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "🗑 Remote Queue leeren":
         await cmd_clear_remote_queue(update, context)
         return
+    if text == "⚡ Serie vorreihen":
+        context.user_data['priority_series_waiting_url'] = True
+        await update.message.reply_text(
+            "⚡ Sende jetzt die SerienStream-URL. Die Serie wird vor allen "
+            "normal wartenden Remote-Jobs eingeordnet."
+        )
+        return
     if text == "▶️ Start":
         await cmd_start(update, context)
         return
@@ -2839,6 +2873,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not text.startswith('http'):
+        return
+
+    if context.user_data.pop('priority_series_waiting_url', False):
+        await _start_central_url(update, context, text, priority=100)
         return
 
     manual_title = None
@@ -4400,16 +4438,17 @@ async def _dl_worker():
 
 def _queue_item_label(persist: dict) -> str:
     """Lesbaren Namen für ein Queue-Item erzeugen."""
+    priority = "⚡ " if int(persist.get('priority', 0) or 0) > 0 else ""
     if persist.get('type') == 'series':
         url   = persist.get('url', '')
         parts = [p for p in url.rstrip('/').split('/') if p]
         name  = parts[-1].replace('-', ' ').title() if parts else url
         emoji = '🎌' if persist.get('is_anime') else '📺'
-        return f"{emoji} {name}"
+        return f"{priority}{emoji} {name}"
     ct    = persist.get('content_type', 'film')
     title = persist.get('manual_title') or persist.get('url', '')[:50]
     emoji = '🎬' if ct == 'film' else ('🎌' if persist.get('is_anime') else '📺')
-    return f"{emoji} {title}"
+    return f"{priority}{emoji} {title}"
 
 
 def _queue_item_already_done(persist: dict) -> bool:
