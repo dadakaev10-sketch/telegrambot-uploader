@@ -55,12 +55,15 @@ Auf dem Remote-Laptop, der herunterladen und hochladen soll:
 ```env
 CENTRAL_QUEUE_ROLE=worker
 CENTRAL_QUEUE_WORKER_ID=remote-macbook-1
-RUN_TELEGRAM_POLLING=false
+CENTRAL_QUEUE_AUTOSTART=false
+RUN_TELEGRAM_POLLING=true
 ```
 
 Beide Geräte verwenden dieselbe `DATABASE_URL`, aber weiterhin eigene
-`BOT_TOKEN`- und `TELETHON_SESSION`-Werte. Der Worker fragt PostgreSQL alle fünf
-Sekunden ab. Fehlgeschlagene Jobs werden mit wachsendem Abstand wieder
+`BOT_TOKEN`- und `TELETHON_SESSION`-Werte. Der Worker startet nach Tippen auf
+**▶️ Remote Queue Download** und fragt PostgreSQL danach alle fünf Sekunden ab.
+Mit `CENTRAL_QUEUE_AUTOSTART=true` kann der frühere automatische Start wieder
+aktiviert werden. Fehlgeschlagene Jobs werden mit wachsendem Abstand wieder
 freigegeben; dauerhaft gelöschte Medien landen im Status `dead`. Nach einem
 Worker-Absturz kann ein reservierter Job nach Ablauf der Lease von einem
 anderen Worker übernommen werden.
@@ -79,7 +82,8 @@ VOE-Links erfolgreich gesammelt wurden, schreibt der Bot sie gemeinsam in
 einer PostgreSQL-Transaktion in die zentrale Queue. Ein Remote-Bot mit
 `CENTRAL_QUEUE_ROLE=worker` beginnt deshalb erst danach mit dem Download.
 
-Alternativ im Telegram-Menü auf **☁️ Remote Queue** tippen und anschließend
-eine SerienStream-, Filmpalast- oder Megakino-URL senden. Bei Megakino fragt
-der Bot zusätzlich nach Film oder Serie. In PostgreSQL werden ausschließlich
-die aufgelösten Player-Links, zum Beispiel VOE oder Doodstream, gespeichert.
+Alternativ im Telegram-Menü auf **🦊 SerienStream → Remote** tippen und
+anschließend eine SerienStream-URL senden. Camoufox wird nur für diese
+Extraktion verwendet und lädt keine Videodatei herunter. In PostgreSQL werden
+die aufgelösten VOE-Links gespeichert. Filmpalast, Megakino und AniWorld nutzen
+diese Funktion nicht und laufen weiterhin direkt über Playwright Chromium.

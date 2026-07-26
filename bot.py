@@ -60,6 +60,9 @@ CENTRAL_QUEUE_WORKER_ID = (
     os.getenv('CENTRAL_QUEUE_WORKER_ID', '').strip()
     or f'{socket.gethostname()}-{uuid.uuid4().hex[:8]}'
 )
+CENTRAL_QUEUE_AUTOSTART = os.getenv(
+    'CENTRAL_QUEUE_AUTOSTART', 'false'
+).lower() in ('1', 'true', 'yes', 'on')
 RUN_TELEGRAM_POLLING = os.getenv('RUN_TELEGRAM_POLLING', 'true').lower() in ('1', 'true', 'yes', 'on')
 try:
     ALLOWED_CHAT_IDS = {
@@ -96,6 +99,7 @@ _series_progress: dict[str, int] = {}
 _watchlist: list[dict] = []
 _reupload_events:  dict[str, asyncio.Event] = {}
 _reupload_choices: dict[str, bool]          = {}
+_central_worker_task: asyncio.Task | None = None
 
 PERMANENT_JOB_FAILURE = 'permanent_job_failure'
 
@@ -162,7 +166,7 @@ logging.info(f"Telethon-Session: {_TG_SESSION_NAME}.session")
 
 MAIN_MENU = ReplyKeyboardMarkup(
     [
-        ["☁️ Remote Queue"],
+        ["🦊 SerienStream → Remote", "▶️ Remote Queue Download"],
         ["🆕 Megakino Last Added", "🆕 HDFilme Latest"],
         ["🆕 Filmpalast Import"],
         ["🔍 Watchcheck", "📋 Queue"],
@@ -2627,38 +2631,42 @@ async def _start_central_url(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
 
     url = _normalize_seriesstream_url(url.strip())
-    if re.search(r'megakino\d*\.(?:to|org|net|club|biz)', url, re.I):
-        context.user_data['central_pending_url'] = url
+    if not _is_seriesstream_url(url):
         await update.message.reply_text(
-            "Ist der Megakino-Link ein Film oder eine Serie?",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🎬 Film", callback_data="central_type_film"),
-                InlineKeyboardButton("📺 Serie", callback_data="central_type_serie"),
-            ]]),
+            "❌ Diese Funktion ist ausschließlich für SerienStream-Links.\n"
+            "Filmpalast, Megakino und AniWorld laufen weiterhin normal über Chromium."
         )
         return
 
-    if _is_seriesstream_url(url):
-        if '/episode-' in url:
-            _spawn_task(_extract_central_single(context.application, chat_id, url, 'serie'), f'central-single-{chat_id}')
-        else:
-            _spawn_task(_extract_central_series(context.application, chat_id, url), f'central-series-{chat_id}')
-        await update.message.reply_text("☁️ Extraktion für die Remote Queue gestartet.")
-        return
-
-    if _is_filmpalast_series(url):
+    if '/episode-' in url:
         _spawn_task(_extract_central_single(context.application, chat_id, url, 'serie'), f'central-single-{chat_id}')
-    elif _is_filmpalast_film(url):
-        _spawn_task(_extract_central_single(context.application, chat_id, url, 'film'), f'central-single-{chat_id}')
     else:
-        context.user_data['central_pending_url'] = url
-        await update.message.reply_text(
-            "Film oder Serie?",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🎬 Film", callback_data="central_type_film"),
-                InlineKeyboardButton("📺 Serie", callback_data="central_type_serie"),
-            ]]),
-        )
+        _spawn_task(_extract_central_series(context.application, chat_id, url), f'central-series-{chat_id}')
+    await update.message.reply_text(
+        "🦊 Camoufox extrahiert nur die VOE-Links und legt sie in die Remote Queue."
+    )
+
+
+async def cmd_remote_queue_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Startet den Chromium-Downloader für die zentrale Queue genau einmal."""
+    global _central_worker_task
+    if not _central_queue:
+        await update.message.reply_text("❌ `DATABASE_URL` fehlt.", parse_mode='Markdown')
+        return
+    if _central_worker_task and not _central_worker_task.done():
+        await update.message.reply_text("▶️ Remote Queue Download läuft bereits.")
+        return
+
+    jobs = await asyncio.to_thread(_central_queue.open_jobs)
+    _central_worker_task = _spawn_task(
+        _central_queue_worker(context.application),
+        "central-queue-worker",
+    )
+    await update.message.reply_text(
+        f"▶️ Remote Queue Download gestartet.\n"
+        f"☁️ {len(jobs)} offene Jobs gefunden.\n"
+        "🌐 Download und Upload werden mit Playwright Chromium verarbeitet."
+    )
 
 
 async def handle_central_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2707,11 +2715,14 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
-    if text == "☁️ Remote Queue":
+    if text in ("☁️ Remote Queue", "🦊 SerienStream → Remote"):
         context.user_data['central_waiting_url'] = True
         await update.message.reply_text(
-            "☁️ Bitte sende jetzt die SerienStream-, Filmpalast- oder Megakino-URL."
+            "🦊 Bitte sende jetzt die SerienStream-URL. Camoufox extrahiert nur die VOE-Links."
         )
+        return
+    if text == "▶️ Remote Queue Download":
+        await cmd_remote_queue_download(update, context)
         return
     if context.user_data.pop('central_waiting_url', False):
         if not text.startswith(('http://', 'https://')):
@@ -2857,17 +2868,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if _is_seriesstream_url(text):
         text = _normalize_seriesstream_url(text)
-        chat_id = update.effective_chat.id
-        if '/episode-' in text:
-            msg = await update.message.reply_text("📺 SerienStream Episode erkannt – lade Folge...")
-            asyncio.create_task(_enqueue(chat_id, msg, process_video,
-                {'type': 'video', 'url': text, 'content_type': 'serie', 'manual_title': manual_title, 'is_anime': False},
-                text, 'serie', manual_title, False))
-            return
-        msg = await update.message.reply_text("📺 SerienStream erkannt – lese Staffeln & Folgen...")
-        asyncio.create_task(_enqueue(chat_id, msg, process_full_series,
-            {'type': 'series', 'url': text, 'is_anime': False, 'chat_id': chat_id},
-            text, False))
+        # SerienStream wird nie mehr lokal verarbeitet: Camoufox löst nur den
+        # VOE-Link auf, der eigentliche Download erfolgt später aus PostgreSQL
+        # über den manuell gestarteten Chromium-Worker.
+        await _start_central_url(update, context, text)
         return
 
     if 'aniworld.to' in text:
@@ -5434,6 +5438,7 @@ async def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("manuel", cmd_manuel))
     app.add_handler(CommandHandler("centralserie", cmd_centralserie))
+    app.add_handler(CommandHandler("remotequeue_download", cmd_remote_queue_download))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_handler(CallbackQueryHandler(handle_type_selection, pattern="^type_"))
     app.add_handler(CallbackQueryHandler(handle_serie_type, pattern="^serie_type_"))
@@ -5455,6 +5460,7 @@ async def main():
             BotCommand("status", "📊 Aktueller Download-Status"),
             BotCommand("manuel", "✍️ Manuelle Serieneingabe (VOE-Links)"),
             BotCommand("centralserie", "☁️ Serie komplett in zentrale Queue"),
+            BotCommand("remotequeue_download", "▶️ Remote Queue mit Chromium starten"),
         ])
         _spawn_task(_dl_worker(), "download-worker")
 
@@ -5467,8 +5473,15 @@ async def main():
             except Exception as e:
                 logging.error(f"Queue-Wiederherstellung Fehler: {e}")
 
-        if CENTRAL_QUEUE_ROLE == 'worker':
-            _spawn_task(_central_queue_worker(app), "central-queue-worker")
+        if CENTRAL_QUEUE_ROLE == 'worker' and CENTRAL_QUEUE_AUTOSTART:
+            global _central_worker_task
+            _central_worker_task = _spawn_task(
+                _central_queue_worker(app), "central-queue-worker"
+            )
+        elif CENTRAL_QUEUE_ROLE == 'worker':
+            logging.info(
+                "Remote Queue wartet auf Button oder /remotequeue_download"
+            )
 
         if RUN_TELEGRAM_POLLING:
             _spawn_task(_polling_watchdog(app), "telegram-polling-watchdog")
