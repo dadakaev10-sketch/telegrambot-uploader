@@ -8,7 +8,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower().replace('-','') != 'utf8'
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
-from datetime import datetime
+from datetime import UTC, datetime
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
@@ -102,6 +102,11 @@ _reupload_choices: dict[str, bool]          = {}
 _central_worker_task: asyncio.Task | None = None
 
 PERMANENT_JOB_FAILURE = 'permanent_job_failure'
+
+
+def _utc_now_iso() -> str:
+    """Aktueller UTC-Zeitpunkt als ISO-String mit Z-Suffix."""
+    return datetime.now(UTC).isoformat(timespec='seconds').replace('+00:00', 'Z')
 
 
 class PermanentMediaUnavailable(RuntimeError):
@@ -2413,7 +2418,7 @@ def _journal_received_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if todo_idx < len(episodes_todo):
         episode = episodes_todo[todo_idx]
     event = {
-        'timestamp': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+        'timestamp': _utc_now_iso(),
         'message_id': getattr(update.message, 'message_id', None),
         'chat_id': getattr(update.effective_chat, 'id', None),
         'urls': urls,
@@ -2689,11 +2694,21 @@ async def cmd_clear_remote_queue(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_clear_remote_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    async def edit_once(text: str) -> None:
+        try:
+            await query.edit_message_text(text)
+        except TgBadRequest as error:
+            # Telegram kann denselben Callback bei einem Doppelklick zweimal
+            # zustellen. Die Queue-Aktion ist idempotent; gleicher Text ist okay.
+            if "Message is not modified" not in str(error):
+                raise
+
     if query.data == "clear_remote_queue_cancel":
-        await query.edit_message_text("Remote Queue wurde nicht verändert.")
+        await edit_once("Remote Queue wurde nicht verändert.")
         return
     if not _central_queue:
-        await query.edit_message_text("❌ DATABASE_URL fehlt.")
+        await edit_once("❌ DATABASE_URL fehlt.")
         return
     result = await asyncio.to_thread(_central_queue.clear_waiting_jobs)
     suffix = []
@@ -2702,7 +2717,7 @@ async def handle_clear_remote_queue(update: Update, context: ContextTypes.DEFAUL
     if result['collecting']:
         suffix.append(f"🦊 {result['collecting']} laufende Serien-Extraktionen bleiben aktiv")
     details = "\n" + "\n".join(suffix) if suffix else ""
-    await query.edit_message_text(
+    await edit_once(
         f"🗑 {result['cancelled']} wartende Remote-Jobs entfernt.{details}"
     )
 
@@ -4037,7 +4052,7 @@ def _watchlist_add(entry_type: str, url: str, chat_id: int | None, is_anime: boo
         'is_anime': bool(is_anime),
         'chat_id': chat_id,
         'enabled': True,
-        'added_at': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+        'added_at': _utc_now_iso(),
     })
     _persist_watchlist()
     logging.info(f"Watchlist hinzugefügt: type={entry_type} anime={is_anime} url={normalized_url}")
@@ -4102,7 +4117,7 @@ def _persist_queue(reason: str = 'update'):
             os.fsync(f.fileno())
         os.replace(tmp_file, QUEUE_FILE)
         event = {
-            'timestamp': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+            'timestamp': _utc_now_iso(),
             'reason': reason,
             'queue': data,
         }
@@ -4202,7 +4217,7 @@ async def _central_job_heartbeat(job_id: int) -> None:
 
 def _archive_dead_job(persist: dict, reason: str) -> None:
     event = {
-        'timestamp': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+        'timestamp': _utc_now_iso(),
         'reason': reason,
         'job': persist,
     }
@@ -4277,7 +4292,7 @@ async def _dl_worker():
                 persist = item.get('persist', {})
                 persist['permanent_failure'] = True
                 persist['last_error'] = failure_text
-                persist['last_failed_at'] = datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+                persist['last_failed_at'] = _utc_now_iso()
                 _archive_dead_job(persist, failure_text or 'Dauerhaft nicht verfügbar')
                 if item in _dl_pending:
                     _dl_pending.remove(item)
@@ -4302,7 +4317,7 @@ async def _dl_worker():
                 persist = item.get('persist', {})
                 persist['failure_count'] = int(persist.get('failure_count', 0)) + 1
                 persist['last_error'] = (failure_text or 'Unbekannter Fehler')[:500]
-                persist['last_failed_at'] = datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+                persist['last_failed_at'] = _utc_now_iso()
                 item['failed'] = True
                 delay = _failed_retry_delay(persist['failure_count'])
                 persist['retry_delay_seconds'] = delay
