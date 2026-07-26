@@ -57,6 +57,12 @@ ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAUL
 ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
 ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS batch_id BIGINT REFERENCES download_batches(id);
 
+-- Ältere Versionen hatten eine globale UNIQUE-Constraint auf dedupe_key.
+-- Dadurch konnten abgeschlossene oder abgebrochene Jobs nie erneut eingestellt
+-- werden. Die aktuelle Queue dedupliziert ausschließlich offene Jobs über den
+-- partiellen Index weiter unten.
+ALTER TABLE download_jobs DROP CONSTRAINT IF EXISTS download_jobs_dedupe_key_key;
+
 CREATE INDEX IF NOT EXISTS download_jobs_claim_idx
     ON download_jobs (status, available_at, id);
 CREATE UNIQUE INDEX IF NOT EXISTS download_jobs_open_dedupe_uq
