@@ -82,8 +82,13 @@ VOE-Links erfolgreich gesammelt wurden, schreibt der Bot sie gemeinsam in
 einer PostgreSQL-Transaktion in die zentrale Queue. Ein Remote-Bot mit
 `CENTRAL_QUEUE_ROLE=worker` beginnt deshalb erst danach mit dem Download.
 
-Alternativ im Telegram-Menü auf **🦊 SerienStream → Remote** tippen und
-anschließend eine SerienStream-URL senden. Camoufox wird nur für diese
-Extraktion verwendet und lädt keine Videodatei herunter. In PostgreSQL werden
-die aufgelösten VOE-Links gespeichert. Filmpalast, Megakino und AniWorld nutzen
-diese Funktion nicht und laufen weiterhin direkt über Playwright Chromium.
+Ein direkt in den Telegram-Chat gesendeter SerienStream-Link startet
+automatisch die Camoufox-Extraktion. Er landet nicht in der lokalen
+`queue.json`: In PostgreSQL werden nur die aufgelösten VOE-Links gespeichert.
+Camoufox lädt keine Videodatei herunter. Filmpalast, Megakino und AniWorld
+nutzen diesen Ablauf nicht und laufen weiterhin direkt über Playwright
+Chromium.
+
+Mit **🗑 Remote Queue leeren** lassen sich nach einer Sicherheitsabfrage alle
+wartenden PostgreSQL-Jobs entfernen. Bereits aktive Downloads und laufende
+Camoufox-Extraktionen werden dabei nicht unterbrochen.

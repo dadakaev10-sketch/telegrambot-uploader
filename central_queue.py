@@ -287,3 +287,49 @@ class CentralQueue:
                 (limit,),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def clear_waiting_jobs(self) -> dict[str, int]:
+        """Entfernt freigegebene, noch nicht gestartete Jobs.
+
+        Bereits von einem Worker reservierte Jobs und laufende Extraktionen
+        bleiben absichtlich unberührt.
+        """
+        with self.connect() as con:
+            cancelled = con.execute(
+                """
+                UPDATE download_jobs AS job
+                SET status='cancelled', updated_at=now(),
+                    locked_by=NULL, locked_at=NULL
+                WHERE status='queued'
+                  AND (
+                      batch_id IS NULL
+                      OR EXISTS (
+                          SELECT 1 FROM download_batches AS batch
+                          WHERE batch.id=job.batch_id AND batch.status='ready'
+                      )
+                  )
+                """,
+            ).rowcount
+            con.execute(
+                """
+                UPDATE download_batches AS batch
+                SET status='cancelled', updated_at=now()
+                WHERE status='ready'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM download_jobs AS job
+                      WHERE job.batch_id=batch.id
+                        AND job.status IN ('queued','processing')
+                  )
+                """
+            )
+            processing = con.execute(
+                "SELECT count(*) AS n FROM download_jobs WHERE status='processing'"
+            ).fetchone()['n']
+            collecting = con.execute(
+                "SELECT count(*) AS n FROM download_batches WHERE status='collecting'"
+            ).fetchone()['n']
+            return {
+                'cancelled': int(cancelled),
+                'processing': int(processing),
+                'collecting': int(collecting),
+            }

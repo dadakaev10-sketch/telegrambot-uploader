@@ -166,7 +166,7 @@ logging.info(f"Telethon-Session: {_TG_SESSION_NAME}.session")
 
 MAIN_MENU = ReplyKeyboardMarkup(
     [
-        ["🦊 SerienStream → Remote", "▶️ Remote Queue Download"],
+        ["▶️ Remote Queue Download", "🗑 Remote Queue leeren"],
         ["🆕 Megakino Last Added", "🆕 HDFilme Latest"],
         ["🆕 Filmpalast Import"],
         ["🔍 Watchcheck", "📋 Queue"],
@@ -2669,6 +2669,44 @@ async def cmd_remote_queue_download(update: Update, context: ContextTypes.DEFAUL
     )
 
 
+async def cmd_clear_remote_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _central_queue:
+        await update.message.reply_text("❌ `DATABASE_URL` fehlt.", parse_mode='Markdown')
+        return
+    await update.message.reply_text(
+        "⚠️ Wirklich alle wartenden Jobs aus der Remote Queue entfernen?\n"
+        "Ein bereits aktiver Download und laufende Camoufox-Extraktionen werden nicht unterbrochen.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "🗑 Ja, wartende Jobs löschen",
+                callback_data="clear_remote_queue_confirm",
+            ),
+            InlineKeyboardButton("Abbrechen", callback_data="clear_remote_queue_cancel"),
+        ]]),
+    )
+
+
+async def handle_clear_remote_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "clear_remote_queue_cancel":
+        await query.edit_message_text("Remote Queue wurde nicht verändert.")
+        return
+    if not _central_queue:
+        await query.edit_message_text("❌ DATABASE_URL fehlt.")
+        return
+    result = await asyncio.to_thread(_central_queue.clear_waiting_jobs)
+    suffix = []
+    if result['processing']:
+        suffix.append(f"▶️ {result['processing']} bereits aktive Jobs laufen weiter")
+    if result['collecting']:
+        suffix.append(f"🦊 {result['collecting']} laufende Serien-Extraktionen bleiben aktiv")
+    details = "\n" + "\n".join(suffix) if suffix else ""
+    await query.edit_message_text(
+        f"🗑 {result['cancelled']} wartende Remote-Jobs entfernt.{details}"
+    )
+
+
 async def handle_central_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2715,21 +2753,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
-    if text in ("☁️ Remote Queue", "🦊 SerienStream → Remote"):
-        context.user_data['central_waiting_url'] = True
-        await update.message.reply_text(
-            "🦊 Bitte sende jetzt die SerienStream-URL. Camoufox extrahiert nur die VOE-Links."
-        )
-        return
     if text == "▶️ Remote Queue Download":
         await cmd_remote_queue_download(update, context)
         return
-    if context.user_data.pop('central_waiting_url', False):
-        if not text.startswith(('http://', 'https://')):
-            context.user_data['central_waiting_url'] = True
-            await update.message.reply_text("❌ Bitte eine vollständige URL senden.")
-            return
-        await _start_central_url(update, context, text)
+    if text == "🗑 Remote Queue leeren":
+        await cmd_clear_remote_queue(update, context)
         return
     if text == "▶️ Start":
         await cmd_start(update, context)
@@ -5439,11 +5467,13 @@ async def main():
     app.add_handler(CommandHandler("manuel", cmd_manuel))
     app.add_handler(CommandHandler("centralserie", cmd_centralserie))
     app.add_handler(CommandHandler("remotequeue_download", cmd_remote_queue_download))
+    app.add_handler(CommandHandler("remotequeue_clear", cmd_clear_remote_queue))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_handler(CallbackQueryHandler(handle_type_selection, pattern="^type_"))
     app.add_handler(CallbackQueryHandler(handle_serie_type, pattern="^serie_type_"))
     app.add_handler(CallbackQueryHandler(handle_reupload, pattern="^reupload_"))
     app.add_handler(CallbackQueryHandler(handle_cancel_queue, pattern="^cancel_queue_"))
+    app.add_handler(CallbackQueryHandler(handle_clear_remote_queue, pattern="^clear_remote_queue_"))
     app.add_handler(CallbackQueryHandler(handle_central_type, pattern="^central_type_"))
 
     print("🤖 Bot läuft!")
@@ -5461,6 +5491,7 @@ async def main():
             BotCommand("manuel", "✍️ Manuelle Serieneingabe (VOE-Links)"),
             BotCommand("centralserie", "☁️ Serie komplett in zentrale Queue"),
             BotCommand("remotequeue_download", "▶️ Remote Queue mit Chromium starten"),
+            BotCommand("remotequeue_clear", "🗑 Wartende Remote Queue leeren"),
         ])
         _spawn_task(_dl_worker(), "download-worker")
 
