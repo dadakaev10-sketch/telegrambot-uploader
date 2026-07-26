@@ -2679,11 +2679,12 @@ async def cmd_clear_remote_queue(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ `DATABASE_URL` fehlt.", parse_mode='Markdown')
         return
     await update.message.reply_text(
-        "⚠️ Wirklich alle wartenden Jobs aus der Remote Queue entfernen?\n"
-        "Ein bereits aktiver Download und laufende Camoufox-Extraktionen werden nicht unterbrochen.",
+        "⚠️ Wirklich die gesamte Remote Queue leeren?\n"
+        "Auch als „processing“ markierte Jobs und laufende Staffel-Entwürfe "
+        "werden in PostgreSQL abgebrochen.",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton(
-                "🗑 Ja, wartende Jobs löschen",
+                "🗑 Ja, alles löschen",
                 callback_data="clear_remote_queue_confirm",
             ),
             InlineKeyboardButton("Abbrechen", callback_data="clear_remote_queue_cancel"),
@@ -2711,14 +2712,10 @@ async def handle_clear_remote_queue(update: Update, context: ContextTypes.DEFAUL
         await edit_once("❌ DATABASE_URL fehlt.")
         return
     result = await asyncio.to_thread(_central_queue.clear_waiting_jobs)
-    suffix = []
-    if result['processing']:
-        suffix.append(f"▶️ {result['processing']} bereits aktive Jobs laufen weiter")
-    if result['collecting']:
-        suffix.append(f"🦊 {result['collecting']} laufende Serien-Extraktionen bleiben aktiv")
-    details = "\n" + "\n".join(suffix) if suffix else ""
     await edit_once(
-        f"🗑 {result['cancelled']} wartende Remote-Jobs entfernt.{details}"
+        f"🗑 Remote Queue geleert.\n"
+        f"Jobs entfernt: {result['cancelled']}\n"
+        f"Staffel-Entwürfe abgebrochen: {result['cancelled_batches']}"
     )
 
 

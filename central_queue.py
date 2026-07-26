@@ -186,6 +186,12 @@ class CentralQueue:
         clean = {k: v for k, v in payload.items() if not k.startswith('_central_')}
         key = self.dedupe_key(clean)
         with self.connect() as con:
+            batch = con.execute(
+                "SELECT status FROM download_batches WHERE id=%s FOR UPDATE",
+                (batch_id,),
+            ).fetchone()
+            if not batch or batch['status'] != 'collecting':
+                raise RuntimeError("Remote-Queue-Batch wurde abgebrochen")
             con.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (key,))
             row = con.execute(
                 "SELECT id FROM download_jobs WHERE dedupe_key=%s AND status IN ('queued','processing')",
@@ -289,47 +295,24 @@ class CentralQueue:
             return [dict(row) for row in rows]
 
     def clear_waiting_jobs(self) -> dict[str, int]:
-        """Entfernt freigegebene, noch nicht gestartete Jobs.
-
-        Bereits von einem Worker reservierte Jobs und laufende Extraktionen
-        bleiben absichtlich unberührt.
-        """
+        """Leert alle offenen Jobs und Batch-Entwürfe der zentralen Queue."""
         with self.connect() as con:
             cancelled = con.execute(
                 """
-                UPDATE download_jobs AS job
+                UPDATE download_jobs
                 SET status='cancelled', updated_at=now(),
                     locked_by=NULL, locked_at=NULL
-                WHERE status='queued'
-                  AND (
-                      batch_id IS NULL
-                      OR EXISTS (
-                          SELECT 1 FROM download_batches AS batch
-                          WHERE batch.id=job.batch_id AND batch.status='ready'
-                      )
-                  )
+                WHERE status IN ('queued','processing')
                 """,
             ).rowcount
-            con.execute(
+            cancelled_batches = con.execute(
                 """
-                UPDATE download_batches AS batch
+                UPDATE download_batches
                 SET status='cancelled', updated_at=now()
-                WHERE status='ready'
-                  AND NOT EXISTS (
-                      SELECT 1 FROM download_jobs AS job
-                      WHERE job.batch_id=batch.id
-                        AND job.status IN ('queued','processing')
-                  )
+                WHERE status IN ('collecting','ready')
                 """
-            )
-            processing = con.execute(
-                "SELECT count(*) AS n FROM download_jobs WHERE status='processing'"
-            ).fetchone()['n']
-            collecting = con.execute(
-                "SELECT count(*) AS n FROM download_batches WHERE status='collecting'"
-            ).fetchone()['n']
+            ).rowcount
             return {
                 'cancelled': int(cancelled),
-                'processing': int(processing),
-                'collecting': int(collecting),
+                'cancelled_batches': int(cancelled_batches),
             }

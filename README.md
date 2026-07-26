@@ -89,6 +89,8 @@ Camoufox lädt keine Videodatei herunter. Filmpalast, Megakino und AniWorld
 nutzen diesen Ablauf nicht und laufen weiterhin direkt über Playwright
 Chromium.
 
-Mit **🗑 Remote Queue leeren** lassen sich nach einer Sicherheitsabfrage alle
-wartenden PostgreSQL-Jobs entfernen. Bereits aktive Downloads und laufende
-Camoufox-Extraktionen werden dabei nicht unterbrochen.
+Mit **🗑 Remote Queue leeren** werden nach einer Sicherheitsabfrage alle
+offenen PostgreSQL-Jobs entfernt – einschließlich `processing`-Jobs und noch
+nicht freigegebener Staffel-Entwürfe. Ein auf einem anderen Rechner bereits
+physisch gestarteter Download kann dort noch bis zum Abschluss oder nächsten
+Fehler weiterlaufen, ist danach aber kein offener PostgreSQL-Auftrag mehr.
