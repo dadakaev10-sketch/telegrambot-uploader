@@ -68,6 +68,12 @@ freigegeben; dauerhaft gelöschte Medien landen im Status `dead`. Nach einem
 Worker-Absturz kann ein reservierter Job nach Ablauf der Lease von einem
 anderen Worker übernommen werden.
 
+Die Worker-ID bleibt standardmäßig pro Rechner stabil. Nach einem Bot-Neustart
+werden Jobs, die derselbe Rechner beim Abbruch als `processing` hinterlassen
+hat, sofort wieder auf `queued` gesetzt. Dadurch muss der Rechner nicht mehr
+auf den Ablauf der Lease warten. Bei mehreren unterschiedlichen Bots auf
+demselben Rechner muss jeder Bot eine eigene `CENTRAL_QUEUE_WORKER_ID` erhalten.
+
 ## Lokal extrahieren, danach remote laden
 
 Ein normaler lokaler Bot darf `CENTRAL_QUEUE_ROLE=local` behalten. Dieser

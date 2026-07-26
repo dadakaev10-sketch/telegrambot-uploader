@@ -263,6 +263,36 @@ class CentralQueue:
             ).fetchone()
             return dict(row) if row else None
 
+    def recover_worker_jobs(
+        self, worker_id: str, legacy_worker_prefix: str | None = None
+    ) -> int:
+        """Gibt Jobs einer vorherigen Instanz desselben Rechners sofort frei."""
+        with self.connect() as con:
+            if legacy_worker_prefix:
+                result = con.execute(
+                    """
+                    UPDATE download_jobs
+                    SET status='queued', available_at=now(), updated_at=now(),
+                        locked_by=NULL, locked_at=NULL,
+                        last_error='Worker wurde neu gestartet'
+                    WHERE status='processing'
+                      AND (locked_by=%s OR locked_by LIKE %s)
+                    """,
+                    (worker_id, f'{legacy_worker_prefix}%'),
+                )
+            else:
+                result = con.execute(
+                    """
+                    UPDATE download_jobs
+                    SET status='queued', available_at=now(), updated_at=now(),
+                        locked_by=NULL, locked_at=NULL,
+                        last_error='Worker wurde neu gestartet'
+                    WHERE status='processing' AND locked_by=%s
+                    """,
+                    (worker_id,),
+                )
+            return int(result.rowcount)
+
     def complete(self, job_id: int, worker_id: str) -> None:
         with self.connect() as con:
             con.execute(

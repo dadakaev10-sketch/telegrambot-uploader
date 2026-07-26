@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import os, re, logging, subprocess, requests, asyncio, platform, json, sqlite3, sys, traceback, ast, socket, uuid, time as _time
+import os, re, logging, subprocess, requests, asyncio, platform, json, sqlite3, sys, traceback, ast, socket, time as _time
 from contextlib import asynccontextmanager
 
 # Windows cp1252 kann keine Emojis → UTF-8 erzwingen
@@ -56,9 +56,12 @@ _central_queue = CentralQueue(
     DATABASE_URL,
     int(os.getenv('CENTRAL_QUEUE_LEASE_SECONDS', '7200')),
 ) if DATABASE_URL else None
-CENTRAL_QUEUE_WORKER_ID = (
-    os.getenv('CENTRAL_QUEUE_WORKER_ID', '').strip()
-    or f'{socket.gethostname()}-{uuid.uuid4().hex[:8]}'
+_configured_worker_id = os.getenv('CENTRAL_QUEUE_WORKER_ID', '').strip()
+# Stabil über Neustarts: So kann derselbe Rechner seine unterbrochenen Jobs
+# sofort zurückholen, statt bis zum Ablauf der Queue-Lease zu warten.
+CENTRAL_QUEUE_WORKER_ID = _configured_worker_id or socket.gethostname()
+CENTRAL_QUEUE_LEGACY_WORKER_PREFIX = (
+    None if _configured_worker_id else f'{socket.gethostname()}-'
 )
 CENTRAL_QUEUE_AUTOSTART = os.getenv(
     'CENTRAL_QUEUE_AUTOSTART', 'false'
@@ -5444,7 +5447,18 @@ async def main():
     _db_init()
     if _central_queue:
         await asyncio.to_thread(_central_queue.init)
+        recovered = await asyncio.to_thread(
+            _central_queue.recover_worker_jobs,
+            CENTRAL_QUEUE_WORKER_ID,
+            CENTRAL_QUEUE_LEGACY_WORKER_PREFIX,
+        )
         logging.info("Zentrale PostgreSQL-Queue aktiv: Rolle=%s", CENTRAL_QUEUE_ROLE)
+        if recovered:
+            logging.warning(
+                "%s unterbrochene Remote-Queue-Job(s) dieses Rechners "
+                "sofort wieder freigegeben",
+                recovered,
+            )
     print("[DEBUG] DB initialisiert")
     _series_progress.update(_load_progress())
     _watchlist.extend(_load_watchlist())
