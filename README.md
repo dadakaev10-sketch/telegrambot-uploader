@@ -95,6 +95,11 @@ Camoufox lädt keine Videodatei herunter. Filmpalast, Megakino und AniWorld
 nutzen diesen Ablauf nicht und laufen weiterhin direkt über Playwright
 Chromium.
 
+Standardmäßig extrahiert Camoufox bis zu vier SerienStream-Folgen gleichzeitig.
+Der Wert ist über `SERIENSTREAM_EXTRACTION_CONCURRENCY=4` konfigurierbar
+(zulässig: 1 bis 8). Download und Upload aus der Remote Queue bleiben davon
+getrennt.
+
 Mit **🗑 Remote Queue leeren** werden nach einer Sicherheitsabfrage alle
 offenen PostgreSQL-Jobs entfernt – einschließlich `processing`-Jobs und noch
 nicht freigegebener Staffel-Entwürfe. Ein auf einem anderen Rechner bereits

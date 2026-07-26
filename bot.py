@@ -83,6 +83,12 @@ if RUN_TELEGRAM_POLLING and not ALLOWED_CHAT_IDS:
 # camoufox läuft headless (kein Fenster pro Folge). Falls ALTCHA/VOE mal hängt,
 # SERIENSTREAM_HEADFUL=1 setzen → Browser wird sichtbar (zur Diagnose/Edge-Case).
 SERIENSTREAM_HEADFUL = os.getenv('SERIENSTREAM_HEADFUL', '').lower() in ('1', 'true', 'yes', 'on')
+try:
+    SERIENSTREAM_EXTRACTION_CONCURRENCY = max(
+        1, min(8, int(os.getenv('SERIENSTREAM_EXTRACTION_CONCURRENCY', '4')))
+    )
+except ValueError as error:
+    raise ValueError("SERIENSTREAM_EXTRACTION_CONCURRENCY muss eine Zahl von 1 bis 8 sein") from error
 
 # Einheitlicher User-Agent für Playwright + yt-dlp + ffmpeg + requests
 # Muss überall gleich sein, sonst lehnt der CDN auth-token URLs ab
@@ -98,6 +104,9 @@ _dl_pending: list[dict] = []
 _dl_active:  dict | None = None          # gerade verarbeitetes Item
 _active_proc: asyncio.subprocess.Process | None = None  # laufender ffmpeg/yt-dlp Prozess
 _dl_status: dict = {}                   # aktueller Download-Status für /status
+_seriesstream_extraction_semaphore = asyncio.Semaphore(
+    SERIENSTREAM_EXTRACTION_CONCURRENCY
+)
 _series_progress: dict[str, int] = {}
 _watchlist: list[dict] = []
 _reupload_events:  dict[str, asyncio.Event] = {}
@@ -2498,52 +2507,82 @@ async def _extract_central_series(app: Application, chat_id: int, series_url: st
             batch_id = batch['id']
             stored_titles = await asyncio.to_thread(_central_queue.batch_job_titles, batch_id)
             stored_count = len(stored_titles)
+            progress_lock = asyncio.Lock()
+            started_count = 0
 
-            for index, episode in enumerate(season_episodes, 1):
+            async def update_progress(text: str, *, markdown: bool = False) -> None:
+                try:
+                    kwargs = {'parse_mode': 'Markdown'} if markdown else {}
+                    await msg.edit_text(text, **kwargs)
+                except TgBadRequest as error:
+                    if "Message is not modified" not in str(error):
+                        logging.warning("Extraktionsstatus konnte nicht aktualisiert werden: %s", error)
+                except Exception as error:
+                    logging.warning("Extraktionsstatus konnte nicht aktualisiert werden: %s", error)
+
+            async def extract_episode(episode: dict) -> None:
+                nonlocal stored_count, deferred_total, started_count
                 title = episode['title']
                 if title in stored_titles:
                     logging.info("Central-Batch #%s: bereits extrahiert: %s", batch_id, title)
-                    continue
-                await msg.edit_text(
-                    f"🦊 *{series_title} · Staffel {season}*\n"
-                    f"Extrahiere Folge {index}/{season_total}\n`{title}`\n\n"
-                    f"💾 Gespeichert: {stored_count}/{season_total}\n"
-                    "Diese Staffel wartet bis zur vollständigen Freigabe.",
-                    parse_mode='Markdown',
-                )
-                try:
-                    extraction_type = episode.get('content_type') or 'serie'
-                    _stream, _title, _referer, _cookies, source_url = await get_stream_url(
-                        episode['url'], extraction_type, source_only=True
-                    )
-                    if not _central_source_url_is_valid(source_url, episode['url']):
-                        raise RuntimeError(f"Keine gültige VOE-/Doodstream-URL für {title}")
-                    payload = {
-                        'type': 'video',
-                        'url': source_url,
-                        'content_type': 'serie',
-                        'manual_title': title,
-                        'is_anime': False,
-                        'chat_id': chat_id,
-                    }
-                    _job_id, created = await asyncio.to_thread(
-                        _central_queue.enqueue_batch_job, batch_id, payload
-                    )
-                    if created:
-                        stored_count += 1
-                        stored_titles.add(title)
-                except Exception as episode_error:
-                    deferred_total += 1
-                    logging.error(
-                        "Central-Batch #%s: %s wird später erneut versucht: %s",
-                        batch_id, title, episode_error,
-                    )
-                    await msg.edit_text(
-                        f"⏭ {title} vorläufig übersprungen\n"
-                        f"Grund: {episode_error}\n\n"
-                        "Der Bot macht mit der nächsten Folge weiter."
-                    )
-                    continue
+                    return
+                async with _seriesstream_extraction_semaphore:
+                    async with progress_lock:
+                        started_count += 1
+                        current_index = started_count
+                        await update_progress(
+                            f"🦊 *{series_title} · Staffel {season}*\n"
+                            f"Starte Folge {current_index}/{season_total}\n`{title}`\n\n"
+                            f"⚡ Parallel: {SERIENSTREAM_EXTRACTION_CONCURRENCY}\n"
+                            f"💾 Gespeichert: {stored_count}/{season_total}",
+                            markdown=True,
+                        )
+                    try:
+                        extraction_type = episode.get('content_type') or 'serie'
+                        _stream, _title, _referer, _cookies, source_url = await get_stream_url(
+                            episode['url'], extraction_type, source_only=True
+                        )
+                        if not _central_source_url_is_valid(source_url, episode['url']):
+                            raise RuntimeError(f"Keine gültige VOE-/Doodstream-URL für {title}")
+                        payload = {
+                            'type': 'video',
+                            'url': source_url,
+                            'content_type': 'serie',
+                            'manual_title': title,
+                            'is_anime': False,
+                            'chat_id': chat_id,
+                        }
+                        _job_id, created = await asyncio.to_thread(
+                            _central_queue.enqueue_batch_job, batch_id, payload
+                        )
+                        async with progress_lock:
+                            if created:
+                                stored_count += 1
+                                stored_titles.add(title)
+                            await update_progress(
+                                f"🦊 *{series_title} · Staffel {season}*\n"
+                                f"✅ `{title}` gespeichert\n"
+                                f"💾 {stored_count}/{season_total} Links",
+                                markdown=True,
+                            )
+                    except Exception as episode_error:
+                        async with progress_lock:
+                            deferred_total += 1
+                            await update_progress(
+                                f"⏭ {title} vorläufig übersprungen\n"
+                                f"Grund: {episode_error}\n\n"
+                                "Andere parallele Folgen laufen weiter."
+                            )
+                        logging.error(
+                            "Central-Batch #%s: %s wird später erneut versucht: %s",
+                            batch_id, title, episode_error,
+                        )
+
+            await asyncio.gather(*(
+                extract_episode(episode)
+                for episode in season_episodes
+                if episode['title'] not in stored_titles
+            ))
 
             missing_after_pass = season_total - stored_count
             if stored_count == 0:
