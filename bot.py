@@ -125,6 +125,20 @@ class PermanentMediaUnavailable(RuntimeError):
     """Der Hoster bestätigt, dass die Mediendatei dauerhaft entfernt wurde."""
 
 
+def _raise_if_http_404(error_text: str, source: str) -> None:
+    """Klassifiziert einen bestätigten HTTP-404 als dauerhaften Medienfehler."""
+    patterns = (
+        r"\bHTTP\s+(?:Error\s+)?404\b",
+        r"\bserver returned 404\b",
+        r"\bstatus(?:=| code[:=]?\s*)404\b",
+        r"\b404\s+Not Found\b",
+    )
+    if any(re.search(pattern, error_text, re.IGNORECASE) for pattern in patterns):
+        raise PermanentMediaUnavailable(
+            f"{source} meldet HTTP 404 – Datei wurde entfernt"
+        )
+
+
 class _LazyTelegramMessage:
     """Erzeugt die Telegram-Statusnachricht erst beim ersten echten Job-Update."""
 
@@ -1205,6 +1219,13 @@ def resolve_normal_quality(master_url: str, referer: str | None, cookie_str: str
         logging.info(f"resolve_normal_quality: {len(stream_lines)} Streams gefunden, wähle Index 1: {chosen[:120]}")
         return chosen
 
+    except requests.HTTPError as e:
+        if getattr(e.response, 'status_code', None) == 404:
+            raise PermanentMediaUnavailable(
+                "Stream-Playlist meldet HTTP 404 – Datei wurde entfernt"
+            ) from e
+        logging.warning(f"resolve_normal_quality fehlgeschlagen: {e} – nutze master_url")
+        return master_url
     except Exception as e:
         logging.warning(f"resolve_normal_quality fehlgeschlagen: {e} – nutze master_url")
         return master_url
@@ -1262,6 +1283,10 @@ async def download_with_browser(stream_url: str, filepath: str, referer: str | N
                 r = await ctx.request.get(url, headers=extra, timeout=30000)
                 if not r.ok:
                     logging.error(f"Browser-Download: m3u8 status={r.status} bei {url[:80]}")
+                    if r.status == 404:
+                        raise PermanentMediaUnavailable(
+                            "Browser-Download meldet HTTP 404 – Datei wurde entfernt"
+                        )
                     return None
                 # binary-safe: bytes holen, dann decodieren mit Fallback
                 raw = await r.body()
@@ -1329,6 +1354,10 @@ async def download_with_browser(stream_url: str, filepath: str, referer: str | N
                                 seg_data[idx] = await r.body()
                                 return
                             logging.warning(f"Seg {idx} status={r.status}")
+                            if r.status == 404:
+                                raise PermanentMediaUnavailable(
+                                    f"Videosegment {idx} meldet HTTP 404 – Datei wurde entfernt"
+                                )
                         except Exception as e:
                             logging.warning(f"Seg {idx}: {e}")
                         await asyncio.sleep(1)
@@ -1448,6 +1477,7 @@ async def download_with_ytdlp(stream_url: str, filepath: str, referer: str | Non
         return False
     error_msg = stderr.decode(errors='replace')
     logging.error(f"yt-dlp Fehler (returncode={proc.returncode}):\n{error_msg}")
+    _raise_if_http_404(error_msg, "yt-dlp")
     return False
 
 
@@ -1507,7 +1537,9 @@ async def download_with_ffmpeg(stream_url: str, filepath: str, referer: str | No
         logging.info("ffmpeg: abgebrochen")
         return False
     if proc.returncode != 0:
-        logging.error(f"ffmpeg Fehler: {stderr.decode(errors='replace')[-500:]}")
+        error_msg = stderr.decode(errors='replace')
+        logging.error(f"ffmpeg Fehler: {error_msg[-500:]}")
+        _raise_if_http_404(error_msg, "ffmpeg")
         return False
     logging.info("ffmpeg: fertig")
     return True
@@ -4074,6 +4106,16 @@ async def process_kinoger_direct(msg, mp4_url: str, manual_title: str, db_conten
         await msg.edit_text(f"✅ Fertig!\n`{filename}.mp4`", parse_mode='Markdown')
         return True
 
+    except PermanentMediaUnavailable as e:
+        logging.warning(f"Permanenter Kinoger-Medienfehler: {mp4_url} – {e}")
+        try:
+            await msg.edit_text(
+                f"🗑 Dauerhaft nicht verfügbar: {e}\n"
+                "Der Auftrag wird nicht erneut versucht."
+            )
+        except Exception:
+            pass
+        return PERMANENT_JOB_FAILURE
     except Exception as e:
         tb = traceback.format_exc()[-1500:]
         logging.error(f"process_kinoger_direct Fehler:\n{traceback.format_exc()}")
