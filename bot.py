@@ -198,15 +198,26 @@ logging.info(f"Telethon-Session: {_TG_SESSION_NAME}.session")
 MAIN_MENU = ReplyKeyboardMarkup(
     [
         ["▶️ Remote Queue Download", "🗑 Remote Queue leeren"],
-        ["⚡ Serie vorreihen"],
+        ["⚡ Serie vorreihen", "🎬 Film Import"],
         ["🆕 Megakino Last Added", "🆕 HDFilme Latest"],
-        ["🆕 Filmpalast Import"],
+        ["🆕 Filmpalast Import", "📊 Status"],
         ["🔍 Watchcheck", "📋 Queue"],
-        ["📊 Status"],
     ],
     resize_keyboard=True,
     is_persistent=True,
 )
+MAIN_MENU_TEXTS = {
+    "▶️ Remote Queue Download",
+    "🗑 Remote Queue leeren",
+    "⚡ Serie vorreihen",
+    "🎬 Film Import",
+    "🆕 Megakino Last Added",
+    "🆕 HDFilme Latest",
+    "🆕 Filmpalast Import",
+    "📊 Status",
+    "🔍 Watchcheck",
+    "📋 Queue",
+}
 
 
 # ─── Scraping ────────────────────────────────────
@@ -529,6 +540,28 @@ def format_filename(title: str) -> str:
 
 # ─── Stream & Download ───────────────────────────
 
+def _is_direct_player_url(url: str) -> bool:
+    """Erkennt direkte VOE-/Doodstream- und kompatible Player-URLs."""
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url.strip())
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+            return False
+        host = parsed.hostname.lower()
+        path = parsed.path.lower()
+        known_host = any(
+            marker in host
+            for marker in ('voe.', 'dood', 'd0od', 'dr0pstream', 'dropstream')
+        )
+        # VOE und Doodstream wechseln regelmäßig auf neutrale Alias-Domains.
+        # Die stabileren Merkmale sind deren Player-Pfade /e/, /d/ und /embed/.
+        return known_host or bool(
+            re.fullmatch(r'/(?:e|d|embed)/[^/]+/?', path)
+        )
+    except Exception:
+        return False
+
+
 @asynccontextmanager
 async def _open_browser(*, camoufox: bool, headless: bool = True):
     """Öffnet Camoufox nur für SerienStream, sonst Playwright Chromium."""
@@ -563,7 +596,10 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
     cookie_str = ""
     source_voe_url = None  # zum DB-Vergleich (erkennt Re-Uploads in besserer Qualität)
 
-    use_camoufox = _is_seriesstream_url(page_url)
+    is_direct_manual_player = (
+        content_type == 'film' and _is_direct_player_url(page_url)
+    )
+    use_camoufox = _is_seriesstream_url(page_url) or is_direct_manual_player
     logging.info(
         "Browser-Backend: %s für %s",
         "Camoufox" if use_camoufox else "Playwright Chromium",
@@ -621,14 +657,38 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
         # die wir dann in `resolve_normal_quality()` auf 720p runterbrechen.
         await context.add_init_script('''
             (() => {
-              const orig = HTMLMediaElement.prototype.canPlayType;
-              HTMLMediaElement.prototype.canPlayType = function(type) {
+                const orig = HTMLMediaElement.prototype.canPlayType;
+                HTMLMediaElement.prototype.canPlayType = function(type) {
                 if (typeof type === 'string' &&
                     /application\\/(vnd\\.apple\\.mpegurl|x-mpegurl)/i.test(type)) {
                   return 'maybe';
                 }
                 return orig.call(this, type);
-              };
+                };
+            })();
+        ''')
+        # Player muss zum Auflösen kurz gestartet werden, darf auf dem Rechner
+        # aber niemals hörbar sein. Besonders Camoufox/Firefox spielt sonst den
+        # Filmton ab, obwohl der Browser headless läuft.
+        await context.add_init_script('''
+            (() => {
+                const mute = media => {
+                    try {
+                        media.muted = true;
+                        media.volume = 0;
+                    } catch (_) {}
+                };
+                const originalPlay = HTMLMediaElement.prototype.play;
+                HTMLMediaElement.prototype.play = function(...args) {
+                    mute(this);
+                    return originalPlay.apply(this, args);
+                };
+                document.addEventListener('play', event => {
+                    if (event.target instanceof HTMLMediaElement) mute(event.target);
+                }, true);
+                document.addEventListener('loadedmetadata', event => {
+                    if (event.target instanceof HTMLMediaElement) mute(event.target);
+                }, true);
             })();
         ''')
 
@@ -673,8 +733,36 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
         def _current_stream() -> str | None:
             return _streams['m3u8'] or _streams['mpd'] or _streams['mp4']
 
+        # ─── Manueller Film: direkte VOE-/Doodstream-Playerseite ───
+        if content_type == 'film' and _is_direct_player_url(page_url):
+            # Doodstreams /d/ ist eine Download-/Landingpage; /e/ enthält den
+            # eigentlichen eingebetteten Player und lässt sich zuverlässiger
+            # über dessen Netzwerkverkehr auflösen.
+            player_url = re.sub(r'/d/', '/e/', page_url, count=1)
+            if player_url != page_url:
+                logging.info(
+                    "Manueller Film-Player: Doodstream /d/ → /e/: %s",
+                    player_url,
+                )
+            else:
+                logging.info(f"Manueller Film-Player: Öffne direkt: {player_url}")
+            source_voe_url = page_url
+            await page.goto(player_url, timeout=60000, wait_until='domcontentloaded')
+            # Camoufox passiert die vorgeschaltete Cloudflare-Prüfung meist
+            # selbstständig. Auf den echten Player warten, statt bereits auf der
+            # Zwischenprüfung nach Video-Requests zu suchen.
+            for _ in range(60):
+                challenge = await page.locator(
+                    'iframe[src*="challenges.cloudflare.com"]'
+                ).count()
+                title = await page.title()
+                if not challenge and 'just a moment' not in title.lower():
+                    break
+                await asyncio.sleep(0.5)
+            await asyncio.sleep(2)
+
         # ─── Film: Titel + data-src gleichzeitig per Playwright extrahieren ───
-        if content_type == 'film':
+        elif content_type == 'film':
             is_hdfilme = 'hdfilme.win' in page_url
             logging.info(f"Film: Öffne Seite: {page_url}")
             await page.goto(page_url, timeout=60000, wait_until='domcontentloaded')
@@ -912,76 +1000,6 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
         # ─── SerienStream: ALTCHA bestätigen und VOE-Redirect öffnen ───
         elif _is_seriesstream_url(page_url):
             page_url = _normalize_seriesstream_url(page_url)
-            logging.info(f"SerienStream: Öffne Episode: {page_url}")
-            await page.goto(page_url, timeout=120000, wait_until='domcontentloaded')
-            await asyncio.sleep(2)
-
-            # Die Seite lädt den bevorzugten deutschen VOE-Hoster automatisch.
-            # Falls das Modal noch nicht offen ist, den deutschen VOE-Button auslösen.
-            modal = page.locator('#playerPrepareModal.show')
-            if await modal.count() == 0:
-                voe_button = page.locator(
-                    '.link-box[data-provider-name="VOE"][data-language-id="1"]'
-                )
-                if await voe_button.count() == 1:
-                    try:
-                        await voe_button.click(timeout=15000)
-                    except Exception:
-                        clicked = await page.evaluate("""() => {
-                            const b = document.querySelector('.link-box[data-provider-name="VOE"][data-language-id="1"]');
-                            if (!b) return false;
-                            b.click();
-                            return true;
-                        }""")
-                        if not clicked:
-                            raise RuntimeError("SerienStream: VOE-Button nicht auslösbar")
-            try:
-                await modal.wait_for(timeout=30000)
-            except Exception:
-                logging.warning("SerienStream: Player-Modal nicht sichtbar geworden")
-            await asyncio.sleep(1)
-
-            captcha = page.locator(
-                '#playerPrepareModal altcha-widget input[type="checkbox"]'
-            )
-            if await captcha.count() == 1 and not await captcha.is_checked():
-                logging.info("SerienStream: ALTCHA wird bestätigt")
-                # ALTCHA-Proof-of-Work auslösen: Das Widget lauscht auf das
-                # change-Event der Checkbox. Ein Playwright-Klick auf das Label
-                # timed out unter proot/Android (Actionability-Check); wir setzen
-                # die Checkbox per JS und dispatchen change/input → der PoW
-                # startet zuverlässig (Desktop UND Handy). Label-Klick als Fallback.
-                triggered = await page.evaluate("""() => {
-                    const inp = document.querySelector('#playerPrepareModal altcha-widget input[type="checkbox"]');
-                    if (!inp) return false;
-                    if (!inp.checked) {
-                        inp.checked = true;
-                        inp.dispatchEvent(new Event('change', {bubbles: true}));
-                        inp.dispatchEvent(new Event('input', {bubbles: true}));
-                    }
-                    return true;
-                }""")
-                if not triggered:
-                    captcha_label = page.locator(
-                        '#playerPrepareModal altcha-widget label[for^="altcha_checkbox_"]'
-                    )
-                    if await captcha_label.count() == 1:
-                        try:
-                            await captcha_label.click(force=True, timeout=30000)
-                        except Exception:
-                            pass
-                try:
-                    await page.wait_for_function(
-                        """() => {
-                            const widget = document.querySelector('#playerPrepareModal altcha-widget .altcha');
-                            const payload = document.querySelector('#playerPrepareModal input[name="altcha"]');
-                            return widget?.dataset?.state === 'verified' && !!payload?.value;
-                        }""",
-                        timeout=180000,
-                    )
-                except Exception as e:
-                    raise RuntimeError(f"SerienStream ALTCHA fehlgeschlagen: {e}") from e
-
             # Das Formular navigiert gezielt das Player-iframe. Auf dessen finaler
             # URL liegt der VOE-Player (die Domain wechselt regelmäßig).
             async def _current_voe_frame_url() -> str | None:
@@ -996,14 +1014,106 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
                         return iframe_src
                 return None
 
-            voe_url = await _current_voe_frame_url()
-            submit = page.locator('#playerPrepareModal button[type="submit"]')
-            for submit_attempt in range(1, 4):
+            voe_url = None
+            for page_attempt in range(1, 4):
+                logging.info(
+                    "SerienStream: Öffne Episode (Seitenversuch %s/3): %s",
+                    page_attempt,
+                    page_url,
+                )
+                await page.goto(page_url, timeout=120000, wait_until='domcontentloaded')
+                await asyncio.sleep(2)
+
+                # Nach jedem Reload werden Modal, ALTCHA und Formular vollständig
+                # neu aufgebaut. Alte Locator/Payloads dürfen nicht wiederverwendet
+                # werden, da der ALTCHA-Nachweis an die aktuelle Seite gebunden ist.
+                modal = page.locator('#playerPrepareModal.show')
+                if await modal.count() == 0:
+                    voe_button = page.locator(
+                        '.link-box[data-provider-name="VOE"][data-language-id="1"]'
+                    )
+                    if await voe_button.count() == 1:
+                        try:
+                            await voe_button.click(timeout=15000)
+                        except Exception:
+                            clicked = await page.evaluate("""() => {
+                                const b = document.querySelector('.link-box[data-provider-name="VOE"][data-language-id="1"]');
+                                if (!b) return false;
+                                b.click();
+                                return true;
+                            }""")
+                            if not clicked:
+                                logging.warning(
+                                    "SerienStream: VOE-Button nicht auslösbar "
+                                    "(Seitenversuch %s/3)",
+                                    page_attempt,
+                                )
+                                continue
+                try:
+                    await modal.wait_for(timeout=30000)
+                except Exception:
+                    logging.warning(
+                        "SerienStream: Player-Modal nicht sichtbar "
+                        "(Seitenversuch %s/3)",
+                        page_attempt,
+                    )
+                await asyncio.sleep(1)
+
+                captcha = page.locator(
+                    '#playerPrepareModal altcha-widget input[type="checkbox"]'
+                )
+                if await captcha.count() == 1 and not await captcha.is_checked():
+                    logging.info(
+                        "SerienStream: ALTCHA wird bestätigt (Seitenversuch %s/3)",
+                        page_attempt,
+                    )
+                    triggered = await page.evaluate("""() => {
+                        const inp = document.querySelector('#playerPrepareModal altcha-widget input[type="checkbox"]');
+                        if (!inp) return false;
+                        if (!inp.checked) {
+                            inp.checked = true;
+                            inp.dispatchEvent(new Event('change', {bubbles: true}));
+                            inp.dispatchEvent(new Event('input', {bubbles: true}));
+                        }
+                        return true;
+                    }""")
+                    if not triggered:
+                        captcha_label = page.locator(
+                            '#playerPrepareModal altcha-widget label[for^="altcha_checkbox_"]'
+                        )
+                        if await captcha_label.count() == 1:
+                            try:
+                                await captcha_label.click(force=True, timeout=30000)
+                            except Exception:
+                                pass
+                    try:
+                        await page.wait_for_function(
+                            """() => {
+                                const widget = document.querySelector('#playerPrepareModal altcha-widget .altcha');
+                                const payload = document.querySelector('#playerPrepareModal input[name="altcha"]');
+                                return widget?.dataset?.state === 'verified' && !!payload?.value;
+                            }""",
+                            timeout=180000,
+                        )
+                    except Exception as error:
+                        logging.warning(
+                            "SerienStream: ALTCHA fehlgeschlagen "
+                            "(Seitenversuch %s/3): %s",
+                            page_attempt,
+                            error,
+                        )
+                        continue
+
+                voe_url = await _current_voe_frame_url()
                 if voe_url:
                     break
+
+                submit = page.locator('#playerPrepareModal button[type="submit"]')
                 if await submit.count() != 1:
-                    logging.warning("SerienStream: Weiter-Button fehlt (Versuch %s)", submit_attempt)
-                    await asyncio.sleep(2)
+                    logging.warning(
+                        "SerienStream: Weiter-Button fehlt (Seitenversuch %s/3)",
+                        page_attempt,
+                    )
                     continue
                 try:
                     await submit.wait_for(state='visible', timeout=15000)
@@ -1033,13 +1143,25 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
                         break
                     await asyncio.sleep(0.5)
                 if not voe_url:
-                    logging.warning(
-                        "SerienStream: Keine Iframe-Navigation nach Submit-Versuch %s/3",
-                        submit_attempt,
-                    )
+                    if page_attempt < 3:
+                        logging.warning(
+                            "SerienStream: Keine Iframe-Navigation "
+                            "(Seitenversuch %s/3) – Seite wird neu geladen",
+                            page_attempt,
+                        )
+                    else:
+                        logging.warning(
+                            "SerienStream: Keine Iframe-Navigation "
+                            "(Seitenversuch 3/3) – keine weiteren Versuche",
+                        )
+                else:
+                    break
 
             if not voe_url:
-                raise RuntimeError("SerienStream: Keine VOE-Weiterleitung nach ALTCHA gefunden")
+                raise RuntimeError(
+                    "SerienStream: Keine VOE-Weiterleitung nach "
+                    "3 vollständigen Seitenversuchen gefunden"
+                )
 
             source_voe_url = voe_url
             logging.info(f"SerienStream: VOE URL extrahiert: {voe_url}")
@@ -1152,6 +1274,34 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
             except Exception as e:
                 logging.warning(f"DOM-Scan nach m3u8 fehlgeschlagen: {e}")
 
+        # Doodstream verwendet signierte CDN-URLs ohne `.mp4` im Pfad. Der
+        # Request-Handler kann sie daher nicht an einer Dateiendung erkennen,
+        # während der echte Wert nach dem Play-Klick in video.currentSrc steht.
+        if not _current_stream() and is_direct_manual_player:
+            try:
+                for frame in page.frames:
+                    try:
+                        video_src = await frame.evaluate('''() => {
+                            const video = document.querySelector('video');
+                            if (!video) return null;
+                            return video.currentSrc || video.src ||
+                                video.querySelector('source')?.src || null;
+                        }''')
+                        if video_src and video_src.startswith(('http://', 'https://')):
+                            _streams['mp4'] = video_src
+                            logging.info(
+                                ">>> Direkter Player-Stream aus video.currentSrc: %s",
+                                video_src[:200],
+                            )
+                            break
+                    except Exception:
+                        pass
+            except Exception as error:
+                logging.warning(
+                    "DOM-Scan nach direktem Player-Stream fehlgeschlagen: %s",
+                    error,
+                )
+
         stream_url = _current_stream()
 
         if not stream_url:
@@ -1159,6 +1309,70 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
                 page_text = (await page.locator('body').inner_text(timeout=3000)).lower()
             except Exception:
                 page_text = ''
+
+            # Doodstream-Aliase zeigen nach dem ersten Play gelegentlich selbst
+            # „Network error – reload and play again“. In derselben Camoufox-
+            # Session bleiben Challenge-Cookies erhalten; Seite neu laden und
+            # erneut Play drücken reicht dann häufig aus.
+            if is_direct_manual_player:
+                for reload_attempt in range(1, 3):
+                    logging.warning(
+                        "Manueller Film-Player: Kein Stream – "
+                        "Reload/Play-Versuch %s/2",
+                        reload_attempt,
+                    )
+                    for key in _streams:
+                        _streams[key] = None
+                    await page.reload(
+                        timeout=60000, wait_until='domcontentloaded'
+                    )
+                    await asyncio.sleep(5)
+                    retry_frames = [
+                        frame for frame in page.frames
+                        if frame.url and 'about:blank' not in frame.url
+                        and not any(host in frame.url for host in AD_HOSTS)
+                    ]
+                    if page.main_frame not in retry_frames:
+                        retry_frames.insert(0, page.main_frame)
+                    for frame in retry_frames:
+                        if _current_stream():
+                            break
+                        for selector in [
+                            'video',
+                            '.vjs-big-play-button',
+                            '[class*="play"]',
+                            '.plyr__control--overlaid',
+                            'button[class*="play"]',
+                        ]:
+                            try:
+                                await frame.click(selector, timeout=1000)
+                                logging.info(
+                                    "Play nach Reload geklickt: %s in %s",
+                                    selector,
+                                    frame.url[:60],
+                                )
+                                await asyncio.sleep(3)
+                                if _current_stream():
+                                    break
+                            except Exception:
+                                pass
+                    for _ in range(20):
+                        if _current_stream():
+                            break
+                        await asyncio.sleep(1)
+                    stream_url = _current_stream()
+                    if stream_url:
+                        logging.info(
+                            "Manueller Film-Player: Stream nach Reload gefunden"
+                        )
+                        break
+                    try:
+                        page_text = (
+                            await page.locator('body').inner_text(timeout=3000)
+                        ).lower()
+                    except Exception:
+                        page_text = ''
+
             permanent_markers = (
                 'datei wurde gelöscht', 'datei wurde entfernt',
                 'video wurde gelöscht', 'video wurde entfernt',
@@ -1168,12 +1382,13 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
                 'file was removed', 'video was removed',
                 'file no longer exists', 'no longer available',
             )
-            if any(marker in page_text for marker in permanent_markers):
-                await browser.close()
-                raise PermanentMediaUnavailable('Hoster meldet: Datei wurde dauerhaft entfernt')
-            screenshot_path = os.path.join(DOWNLOAD_DIR, "debug_screenshot.png")
-            await page.screenshot(path=screenshot_path, full_page=True)
-            logging.warning(f"Kein Stream! Screenshot: {screenshot_path}")
+            if not stream_url:
+                if any(marker in page_text for marker in permanent_markers):
+                    await browser.close()
+                    raise PermanentMediaUnavailable('Hoster meldet: Datei wurde dauerhaft entfernt')
+                screenshot_path = os.path.join(DOWNLOAD_DIR, "debug_screenshot.png")
+                await page.screenshot(path=screenshot_path, full_page=True)
+                logging.warning(f"Kein Stream! Screenshot: {screenshot_path}")
         else:
             stream_type = 'HLS' if _streams['m3u8'] else ('DASH' if _streams['mpd'] else 'MP4')
             logging.info(f"Stream gewählt: {stream_type} – {stream_url[:120]}")
@@ -1339,19 +1554,37 @@ async def download_with_browser(stream_url: str, filepath: str, referer: str | N
                 logging.error("Browser-Download: keine Segmente gefunden")
                 return False
             logging.info(f"Browser-Download: {len(segments)} Segmente")
+            _dl_status.update({
+                'progress_mode': 'segments',
+                'segments_done': 0,
+                'segments_total': len(segments),
+                'percent': 0,
+            })
 
             ts_path = filepath.replace('.mp4', '.ts')
             seg_data = [None] * len(segments)
             sem = asyncio.Semaphore(8)
             start = _time.monotonic()
+            completed_segments = 0
 
             async def fetch_seg(idx, url):
+                nonlocal completed_segments
                 async with sem:
                     for _ in range(3):
                         try:
                             r = await ctx.request.get(url, headers=extra, timeout=30000)
                             if r.ok:
-                                seg_data[idx] = await r.body()
+                                data = await r.body()
+                                if seg_data[idx] is None:
+                                    seg_data[idx] = data
+                                    completed_segments += 1
+                                    _dl_status.update({
+                                        'segments_done': completed_segments,
+                                        'segments_total': len(segments),
+                                        'percent': int(
+                                            completed_segments * 100 / len(segments)
+                                        ),
+                                    })
                                 return
                             logging.warning(f"Seg {idx} status={r.status}")
                             if r.status == 404:
@@ -2448,6 +2681,217 @@ async def get_series_episodes(series_url: str, is_anime: bool = False) -> tuple[
     return series_title, episodes
 
 
+async def _get_watch_series_overview(
+    series_url: str,
+    is_anime: bool = False,
+) -> tuple[str, list[int]]:
+    """Liest für den Watchcheck nur Titel und vorhandene Staffelnummern."""
+    if _is_seriesstream_url(series_url):
+        normalized_url = _normalize_seriesstream_url(series_url).rstrip('/')
+        season_match = re.search(r'/staffel-(\d+)', normalized_url)
+        series_base_url = normalized_url[:season_match.start()] if season_match else normalized_url
+
+        def _fetch() -> tuple[str, list[int]]:
+            headers = {'User-Agent': USER_AGENT, 'Referer': 'https://serienstream.to/'}
+            response = requests.get(series_base_url, headers=headers, timeout=30)
+            response.raise_for_status()
+            parsed = _sto_parse_html(response.text, series_base_url)
+            seasons = sorted({int(value) for value in parsed.get('season_nums', [])})
+            return parsed.get('title') or 'Serie', seasons
+
+        return await asyncio.to_thread(_fetch)
+
+    if 'aniworld.to' in series_url:
+        base = 'https://aniworld.to'
+        season_match = re.search(r'/staffel-(\d+)', series_url)
+        series_base_url = series_url[:season_match.start()] if season_match else series_url.rstrip('/')
+
+        def _fetch() -> tuple[str, list[int]]:
+            headers = {'User-Agent': USER_AGENT, 'Referer': base + '/'}
+            response = requests.get(series_base_url, headers=headers, timeout=30)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+            h1 = soup.select_one('h1[itemprop="name"]') or soup.select_one('h1')
+            title = h1.get_text(' ', strip=True) if h1 else 'Anime'
+            seasons = set()
+            for link in soup.select('a[href*="/staffel-"]'):
+                href = link.get('href', '')
+                if '/episode-' in href:
+                    continue
+                match = re.search(r'/staffel-(\d+)', href)
+                if match:
+                    seasons.add(int(match.group(1)))
+            return title, sorted(seasons)
+
+        return await asyncio.to_thread(_fetch)
+
+    # Quellen wie Megakino enthalten üblicherweise bereits genau eine Staffel
+    # in der URL. HDFilme liefert alle Episoden kompakt in einem API-Request.
+    title, episodes = await get_series_episodes(series_url, is_anime)
+    return title, sorted({int(ep['season']) for ep in episodes if ep.get('season') is not None})
+
+
+def _fetch_seriesstream_latest_german() -> dict[str, list[dict]]:
+    """Liest die kompakte Liste neuer deutschsprachiger SerienStream-Folgen."""
+    from urllib.parse import urljoin
+
+    response = requests.get(
+        'https://serienstream.to/',
+        headers={'User-Agent': USER_AGENT, 'Referer': 'https://serienstream.to/'},
+        timeout=30,
+    )
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, 'html.parser')
+    grouped: dict[str, list[dict]] = {}
+    seen: set[str] = set()
+
+    for row in soup.select('a.latest-episode-row[href*="/serie/"]'):
+        german_flag = row.select_one(
+            '.ep-lang use[href="#icon-flag-german"], '
+            '.ep-lang use[xlink\\:href="#icon-flag-german"]'
+        )
+        if german_flag is None:
+            continue
+
+        href = row.get('href', '').strip()
+        match = re.search(
+            r'(/serie/[^/?#]+)(?:/staffel-(\d+))/episode-(\d+)',
+            href,
+            re.IGNORECASE,
+        )
+        if not match:
+            continue
+
+        episode_url = urljoin('https://serienstream.to/', href)
+        if episode_url in seen:
+            continue
+        seen.add(episode_url)
+
+        series_base = _normalize_watch_url(
+            urljoin('https://serienstream.to/', match.group(1))
+        )
+        title_el = row.select_one('.ep-title')
+        title = (
+            title_el.get('title', '').strip()
+            if title_el else ''
+        ) or (
+            row.select_one('.ep-title-text').get_text(' ', strip=True)
+            if row.select_one('.ep-title-text') else 'Serie'
+        )
+        grouped.setdefault(series_base, []).append({
+            'url': episode_url,
+            'season': int(match.group(2)),
+            'episode': int(match.group(3)),
+            'title': title,
+        })
+
+    logging.info(
+        "SerienStream Neueste Folgen: %s deutsche Folgen aus %s Serien",
+        sum(map(len, grouped.values())),
+        len(grouped),
+    )
+    return grouped
+
+
+def _seriesstream_watch_base(url: str) -> str:
+    normalized = _normalize_seriesstream_url(url).rstrip('/')
+    return re.sub(r'/staffel-\d+(?:/.*)?$', '', normalized)
+
+
+def _fetch_aniworld_latest_german() -> dict[str, list[dict]]:
+    """Liest AniWorld-Neuerscheinungen mit ausschließlich deutscher Tonspur."""
+    from urllib.parse import urljoin, urlsplit
+
+    response = requests.get(
+        'https://aniworld.to/neue-episoden',
+        headers={'User-Agent': USER_AGENT, 'Referer': 'https://aniworld.to/'},
+        timeout=30,
+    )
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, 'html.parser')
+    grouped: dict[str, list[dict]] = {}
+    seen: set[str] = set()
+
+    for link in soup.select('a[href*="/anime/stream/"][href*="/episode-"]'):
+        href = link.get('href', '').strip()
+        match = re.search(
+            r'(/anime/stream/[^/?#]+)(?:/staffel-(\d+))/episode-(\d+)',
+            href,
+            re.IGNORECASE,
+        )
+        if not match:
+            continue
+
+        # Die Flagge ist ein Geschwisterelement des Links. Nur german.svg ist
+        # deutsche Synchronisation; japanese-german.svg (Untertitel) zählt nicht.
+        row = link.parent
+        flag_sources = {
+            urlsplit(
+                (img.get('data-src') or img.get('src') or '').strip()
+            ).path.rsplit('/', 1)[-1].lower()
+            for img in row.select('img.flag')
+        }
+        if 'german.svg' not in flag_sources:
+            continue
+
+        episode_url = urljoin('https://aniworld.to/', href)
+        if episode_url in seen:
+            continue
+        seen.add(episode_url)
+
+        series_base = _normalize_watch_url(
+            urljoin('https://aniworld.to/', match.group(1))
+        )
+        title_el = link.select_one('strong')
+        grouped.setdefault(series_base, []).append({
+            'url': episode_url,
+            'season': int(match.group(2)),
+            'episode': int(match.group(3)),
+            'title': title_el.get_text(' ', strip=True) if title_el else 'Anime',
+        })
+
+    logging.info(
+        "AniWorld Neue Episoden: %s deutsch synchronisierte Folgen aus %s Anime",
+        sum(map(len, grouped.values())),
+        len(grouped),
+    )
+    return grouped
+
+
+def _aniworld_watch_base(url: str) -> str:
+    normalized = _normalize_watch_url(url)
+    return re.sub(r'/staffel-\d+(?:/.*)?$', '', normalized)
+
+
+def _watch_season_url(series_url: str, season: int) -> str:
+    """Erzeugt eine Staffel-URL, sofern die Quelle Staffelpfade unterstützt."""
+    if _is_seriesstream_url(series_url) or 'aniworld.to' in series_url:
+        normalized = (
+            _normalize_seriesstream_url(series_url)
+            if _is_seriesstream_url(series_url)
+            else series_url
+        ).rstrip('/')
+        normalized = re.sub(r'/staffel-\d+(?:/.*)?$', '', normalized)
+        return f"{normalized}/staffel-{season}"
+    return series_url
+
+
+async def _get_watch_season_episodes(
+    series_url: str,
+    season: int,
+    is_anime: bool = False,
+) -> tuple[str, list[dict]]:
+    """Lädt nur die gewünschte Staffel und filtert defensive Fremdtreffer."""
+    title, episodes = await get_series_episodes(
+        _watch_season_url(series_url, season),
+        is_anime,
+    )
+    return title, [
+        ep for ep in episodes
+        if int(ep.get('season', season)) == int(season)
+    ]
+
+
 # ─── Bot Handler ─────────────────────────────────
 
 def _journal_received_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2480,7 +2924,26 @@ def _journal_received_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except Exception as error:
         logging.error(f"Empfangenen Link sichern fehlgeschlagen: {error}")
 
+
+def _clear_interaction_state(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Beendet offene Eingabedialoge, ohne Queue-Jobs anzutasten."""
+    cleared = False
+    for key in (
+        'manual_film_import',
+        'manuel',
+        'kinoger',
+        'priority_series_waiting_url',
+        'pending_url',
+        'manual_title',
+    ):
+        if key in context.user_data:
+            context.user_data.pop(key, None)
+            cleared = True
+    return cleared
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _clear_interaction_state(context)
     await update.message.reply_text(
         "🤖 Video Bot bereit!\n\n"
         "Schick mir einen Link und wähle den Typ.\n"
@@ -2488,6 +2951,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown',
         reply_markup=MAIN_MENU,
     )
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if _clear_interaction_state(context):
+        text = "✅ Eingabe abgebrochen."
+    else:
+        text = "ℹ️ Keine offene Eingabe."
+    await update.message.reply_text(text, reply_markup=MAIN_MENU)
 
 
 def _central_source_url_is_valid(source_url: str | None, page_url: str) -> bool:
@@ -2861,11 +3332,14 @@ async def cmd_centralserie(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _journal_received_link(update, context)
-    # Manuel-Modus hat Vorrang
-    if await handle_manuel_input(update, context):
+    text = update.message.text.strip()
+    # Hauptmenü-Buttons dürfen einen versehentlich offenen Eingabedialog immer
+    # verlassen. Nur normale Texte werden an den aktiven Dialog weitergereicht.
+    if text in MAIN_MENU_TEXTS:
+        _clear_interaction_state(context)
+    elif await handle_manuel_input(update, context):
         return
 
-    text = update.message.text.strip()
     if text == "▶️ Remote Queue Download":
         await cmd_remote_queue_download(update, context)
         return
@@ -2878,6 +3352,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚡ Sende jetzt die SerienStream-URL. Die Serie wird vor allen "
             "normal wartenden Remote-Jobs eingeordnet."
         )
+        return
+    if text == "🎬 Film Import":
+        await cmd_film_import(update, context)
         return
     if text == "▶️ Start":
         await cmd_start(update, context)
@@ -3093,7 +3570,13 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
                 return False
             fn = format_filename(extracted_title)
             db_ct = 'serie' if _is_fp_serie else ('film' if is_filmpalast else content_type)
-            return _db_exists(db_ct, fn, is_anime)
+            if not _db_exists(db_ct, fn, is_anime):
+                return False
+            # Alte Film-Einträge ohne gespeicherte Quelle müssen bis zum Player
+            # weiterlaufen, damit ein Qualitäts-Upgrade möglich ist.
+            if db_ct == 'film' and not _db_get_voe('film', fn, is_anime):
+                return False
+            return True
 
         # Stream abfangen (Playwright macht alles: Seite öffnen, iframe extrahieren, Play klicken)
         # Gibt (stream_url, film_title, referer, cookie_str, source_voe_url) zurück
@@ -3126,10 +3609,31 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
                     await msg.edit_text(f"⏭ Bereits vorhanden (gleiche Quelle): `{filename}`", parse_mode='Markdown')
                     return True
                 elif not stored_voe:
-                    # Alter Eintrag ohne voe_url → konservativ: skippen wie bisher
-                    logging.info(f"[SKIP] Bereits vorhanden (kein VOE in DB): {filename}")
-                    await msg.edit_text(f"⏭ Bereits vorhanden: `{filename}`", parse_mode='Markdown')
-                    return True
+                    if source_voe_url:
+                        # Alter Eintrag ohne gespeicherte Quelle, aber der aktuelle
+                        # Einzelauftrag liefert eine konkrete VOE-URL: als
+                        # Qualitäts-Upgrade neu laden und den DB-Eintrag ergänzen.
+                        update_due_to_new_source = True
+                        logging.info(
+                            "[UPDATE] Vorhandener Film ohne VOE in DB: "
+                            "%s – neue Quelle wird als Qualitäts-Upgrade geladen",
+                            filename,
+                        )
+                        await msg.edit_text(
+                            f"♻️ Qualitäts-Upgrade (neue Quelle): `{filename}`",
+                            parse_mode='Markdown',
+                        )
+                    else:
+                        # Ohne bekannte neue Quelle lässt sich kein Upgrade
+                        # begründen; vorhandenen Eintrag weiterhin überspringen.
+                        logging.info(
+                            f"[SKIP] Bereits vorhanden (keine neue Quelle): {filename}"
+                        )
+                        await msg.edit_text(
+                            f"⏭ Bereits vorhanden: `{filename}`",
+                            parse_mode='Markdown',
+                        )
+                        return True
                 else:
                     # Quelle hat sich geändert → wahrscheinlich bessere Qualität, neu hochladen
                     update_due_to_new_source = True
@@ -3176,6 +3680,8 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
             # Progress-Monitor: alle 5s Dateigröße in Telegram updaten
             dl_start = _time.monotonic()
             stop_progress = asyncio.Event()
+            for key in ('progress_mode', 'segments_done', 'segments_total', 'percent'):
+                _dl_status.pop(key, None)
             _dl_status.update({'filename': filename, 'start': dl_start, 'size_mb': 0, 'phase': 'download'})
 
             async def progress_monitor():
@@ -3192,8 +3698,19 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
                         m, s = divmod(elapsed, 60)
                         _dl_status['size_mb'] = size_mb
                         _dl_status['elapsed'] = elapsed
+                        if (
+                            _dl_status.get('progress_mode') == 'segments'
+                            and _dl_status.get('segments_total')
+                        ):
+                            done = int(_dl_status.get('segments_done', 0))
+                            total = int(_dl_status['segments_total'])
+                            percent = int(_dl_status.get('percent', 0))
+                            progress_text = f"{percent}% · {done}/{total} Segmente"
+                        else:
+                            progress_text = f"{size_mb:.0f} MB"
                         await msg.edit_text(
-                            f"📥 Lade herunter... ⏱ {m:02d}:{s:02d}\n`{filename}`\n💾 {size_mb:.0f} MB",
+                            f"📥 Lade herunter... ⏱ {m:02d}:{s:02d}\n"
+                            f"`{filename}`\n💾 {progress_text}",
                             parse_mode='Markdown'
                         )
                     except:
@@ -3206,6 +3723,8 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
                 success = await download_with_browser(stream_url, filepath, referer, cookie_str)
                 if not success:
                     logging.warning("Browser-Download fehlgeschlagen, Fallback auf yt-dlp...")
+                    for key in ('progress_mode', 'segments_done', 'segments_total', 'percent'):
+                        _dl_status.pop(key, None)
                     # Für yt-dlp/ffmpeg: Variant explizit auflösen (mittlere Qualität)
                     stream_url = resolve_normal_quality(stream_url, referer, cookie_str)
             if not success:
@@ -3276,7 +3795,22 @@ async def process_full_series(msg, series_url: str, is_anime: bool = False, star
             return False
 
         total = len(episodes)
-        _watchlist_update('series', series_url, is_anime, last_seen_total=total, last_series_title=series_title)
+        season_episode_numbers = {
+            str(season): sorted({
+                int(ep['episode']) for ep in episodes
+                if int(ep.get('season', 0)) == season
+            })
+            for season in sorted({int(ep['season']) for ep in episodes})
+        }
+        _watchlist_update(
+            'series',
+            series_url,
+            is_anime,
+            last_seen_total=total,
+            last_series_title=series_title,
+            last_season=max(map(int, season_episode_numbers), default=None),
+            season_episode_numbers=season_episode_numbers,
+        )
         logging.info(f"Serie '{series_title}': {total} Folgen gesamt")
         start_hint = f" (ab Folge {start_from + 1})" if start_from > 0 else ""
         await msg.edit_text(
@@ -3340,7 +3874,14 @@ async def process_full_series(msg, series_url: str, is_anime: bool = False, star
         if completed_all:
             _series_progress.pop(series_url, None)
             _persist_progress()
-            _watchlist_update('series', series_url, is_anime, last_seen_total=total, last_series_title=series_title)
+            _watchlist_update(
+                'series',
+                series_url,
+                is_anime,
+                last_seen_total=total,
+                last_series_title=series_title,
+                incomplete_seasons=[],
+            )
             await msg.edit_text(
                 f"✅ *{series_title}*\nAlle {total} Folgen fertig!",
                 parse_mode='Markdown'
@@ -3350,6 +3891,20 @@ async def process_full_series(msg, series_url: str, is_anime: bool = False, star
             f"⚠️ *{series_title}*\nMindestens eine Folge ist fehlgeschlagen. Auftrag bleibt gespeichert.",
             parse_mode='Markdown'
         )
+        failed_season = int(season_num) if str(season_num).isdigit() else None
+        if failed_season is not None:
+            watch_entry = _watchlist_find('series', series_url, is_anime) or {}
+            incomplete = {
+                int(value) for value in watch_entry.get('incomplete_seasons', [])
+                if str(value).isdigit()
+            }
+            incomplete.add(failed_season)
+            _watchlist_update(
+                'series',
+                series_url,
+                is_anime,
+                incomplete_seasons=sorted(incomplete),
+            )
         return False
 
     except Exception as e:
@@ -4600,6 +5155,46 @@ async def _watchlist_check_once(app, notify_empty: bool = False, manual_chat_id:
         logging.info("Watchlist-Check übersprungen: Queue/Download ist aktiv")
         return checked_items, added_jobs
 
+    seriesstream_latest: dict[str, list[dict]] | None = None
+    if any(
+        item.get('enabled', True)
+        and item.get('type') == 'series'
+        and not bool(item.get('is_anime', False))
+        and _is_seriesstream_url(item.get('url', ''))
+        for item in _watchlist
+    ):
+        try:
+            seriesstream_latest = await asyncio.to_thread(
+                _fetch_seriesstream_latest_german
+            )
+        except Exception:
+            # Bei einer vorübergehend nicht erreichbaren Startseite bleibt der
+            # bisherige Staffel-Check als sicherer Fallback aktiv.
+            logging.warning(
+                "SerienStream-Liste der neuesten Folgen nicht lesbar; "
+                "verwende Staffel-Fallback:\n%s",
+                traceback.format_exc(),
+            )
+
+    aniworld_latest: dict[str, list[dict]] | None = None
+    if any(
+        item.get('enabled', True)
+        and item.get('type') == 'series'
+        and bool(item.get('is_anime', False))
+        and 'aniworld.to' in item.get('url', '')
+        for item in _watchlist
+    ):
+        try:
+            aniworld_latest = await asyncio.to_thread(
+                _fetch_aniworld_latest_german
+            )
+        except Exception:
+            logging.warning(
+                "AniWorld-Liste der neuen Episoden nicht lesbar; "
+                "verwende Staffel-Fallback:\n%s",
+                traceback.format_exc(),
+            )
+
     for entry in list(_watchlist):
         if not entry.get('enabled', True):
             continue
@@ -4617,33 +5212,175 @@ async def _watchlist_check_once(app, notify_empty: bool = False, manual_chat_id:
             if entry_type == 'series':
                 if _watchlist_job_exists('series', url, is_anime):
                     continue
-                series_title, episodes = await get_series_episodes(url, is_anime)
-                current_total = len(episodes)
-                previous_total = entry.get('last_seen_total')
-                _watchlist_update('series', url, is_anime, last_series_title=series_title)
+                entry_incomplete = {
+                    int(value) for value in (entry.get('incomplete_seasons') or [])
+                    if str(value).isdigit()
+                }
+                german_latest: list[dict] = []
+                latest_filter_active = False
+                if (
+                    not is_anime
+                    and _is_seriesstream_url(url)
+                    and seriesstream_latest is not None
+                ):
+                    latest_filter_active = True
+                    german_latest = seriesstream_latest.get(
+                        _seriesstream_watch_base(url),
+                        [],
+                    )
+                    if not german_latest and not entry_incomplete:
+                        logging.info(
+                            "Watchlist unverändert: kein neuer deutscher "
+                            "SerienStream-Eintrag für %s",
+                            entry.get('last_series_title') or url,
+                        )
+                        continue
+                elif (
+                    is_anime
+                    and 'aniworld.to' in url
+                    and aniworld_latest is not None
+                ):
+                    latest_filter_active = True
+                    german_latest = aniworld_latest.get(
+                        _aniworld_watch_base(url),
+                        [],
+                    )
+                    if not german_latest and not entry_incomplete:
+                        logging.info(
+                            "Watchlist unverändert: keine neue rein deutsche "
+                            "AniWorld-Folge für %s",
+                            entry.get('last_series_title') or url,
+                        )
+                        continue
 
-                if previous_total is None:
-                    _watchlist_update('series', url, is_anime, last_seen_total=current_total)
+                series_title, available_seasons = await _get_watch_series_overview(url, is_anime)
+                if not available_seasons:
                     continue
 
-                if current_total <= previous_total:
-                    if current_total < previous_total:
-                        _watchlist_update('series', url, is_anime, last_seen_total=current_total)
-                    continue
+                latest_season = max(available_seasons)
+                previous_latest = entry.get('last_season')
+                stored_numbers = {
+                    str(key): sorted({int(value) for value in values})
+                    for key, values in (entry.get('season_episode_numbers') or {}).items()
+                    if isinstance(values, list)
+                }
+                stored_german_numbers = {
+                    str(key): sorted({int(value) for value in values})
+                    for key, values in (entry.get('german_episode_numbers') or {}).items()
+                    if isinstance(values, list)
+                }
+                incomplete = {
+                    value for value in entry_incomplete
+                    if value in available_seasons
+                }
+                german_episode_keys = {
+                    (int(item['season']), int(item['episode']))
+                    for item in german_latest
+                }
+                known_german_episode_keys = set(german_episode_keys)
+                for season_key, episode_numbers in stored_german_numbers.items():
+                    if str(season_key).isdigit() and int(season_key) in incomplete:
+                        known_german_episode_keys.update(
+                            (int(season_key), int(episode))
+                            for episode in episode_numbers
+                        )
+                german_seasons = {
+                    int(item['season']) for item in german_latest
+                    if int(item['season']) in available_seasons
+                }
 
-                new_episodes = [ep for ep in episodes[previous_total:] if not ep.get('skip', False)]
-                if not new_episodes:
-                    _watchlist_update('series', url, is_anime, last_seen_total=current_total)
-                    continue
+                # Normalfall: nur die letzte Staffel. Zusätzlich werden ausschließlich
+                # Staffeln geprüft, die zuvor ausdrücklich als unvollständig markiert
+                # wurden. Alle anderen alten Staffeln bleiben unangetastet.
+                if latest_filter_active:
+                    seasons_to_check = sorted(incomplete | german_seasons)
+                else:
+                    seasons_to_check = sorted(incomplete | {latest_season})
+                discovered: dict[str, list[int]] = dict(stored_numbers)
+                discovered_german: dict[str, list[int]] = dict(stored_german_numbers)
+                for season, episode in german_episode_keys:
+                    key = str(season)
+                    discovered_german[key] = sorted(
+                        set(discovered_german.get(key, [])) | {episode}
+                    )
+                queued_total = 0
+                still_incomplete: set[int] = set()
 
-                queued = await _enqueue_series_episode_batch(app, chat_id, series_title, new_episodes, is_anime)
-                _watchlist_update('series', url, is_anime, last_seen_total=current_total)
-                if queued:
+                for season in seasons_to_check:
+                    season_title, episodes = await _get_watch_season_episodes(url, season, is_anime)
+                    if season_title:
+                        series_title = season_title
+                    current_numbers = sorted({
+                        int(ep['episode']) for ep in episodes
+                        if ep.get('episode') is not None
+                    })
+                    key = str(season)
+                    previous_numbers = set(stored_numbers.get(key, []))
+                    discovered[key] = current_numbers
+
+                    # Migration alter Watchlist-Einträge: Die aktuellste Staffel wird
+                    # einmal als Ausgangsstand gespeichert. Frühere Staffeln werden
+                    # dafür bewusst nicht erneut geladen.
+                    migrating = previous_latest is None and key not in stored_numbers
+                    if migrating and not incomplete and not german_episode_keys:
+                        logging.info(
+                            "Watchlist migriert: %s – Staffel %s mit %s Folgen als Ausgangsstand",
+                            series_title, season, len(current_numbers),
+                        )
+                        continue
+
+                    new_numbers = set(current_numbers) - previous_numbers
+                    candidates = [
+                        ep for ep in episodes
+                        if (
+                            int(ep.get('episode', 0)) in new_numbers
+                            or season in incomplete
+                            or (previous_latest is not None and season > int(previous_latest))
+                        )
+                        and (
+                            not latest_filter_active
+                            or (season, int(ep.get('episode', 0))) in known_german_episode_keys
+                        )
+                        and not ep.get('skip', False)
+                    ]
+                    if candidates:
+                        queued_total += await _enqueue_series_episode_batch(
+                            app, chat_id, series_title, candidates, is_anime
+                        )
+                        still_incomplete.add(season)
+                    elif any(
+                        not ep.get('skip', False)
+                        and (
+                            not latest_filter_active
+                            or (
+                                season,
+                                int(ep.get('episode', 0)),
+                            ) in known_german_episode_keys
+                        )
+                        for ep in episodes
+                    ):
+                        # Noch nicht zentral erledigt, aber eventuell schon in einer
+                        # Queue: Staffel beim nächsten Watchcheck weiter beobachten.
+                        still_incomplete.add(season)
+
+                _watchlist_update(
+                    'series',
+                    url,
+                    is_anime,
+                    last_series_title=series_title,
+                    last_season=latest_season,
+                    season_episode_numbers=discovered,
+                    german_episode_numbers=discovered_german,
+                    incomplete_seasons=sorted(still_incomplete),
+                )
+                if queued_total:
                     await app.bot.send_message(
                         chat_id,
-                        f"🆕 Watchlist: {series_title}\n{queued} neue Folge(n) ab Stand {previous_total} -> {current_total} in die Queue gelegt."
+                        f"🆕 Watchlist: {series_title}\n"
+                        f"{queued_total} neue bzw. noch fehlende Folge(n) aus "
+                        f"Staffel {', '.join(map(str, seasons_to_check))} in die Queue gelegt."
                     )
-                    added_jobs += queued
+                    added_jobs += queued_total
             elif entry_type == 'bulk_films':
                 if _watchlist_job_exists('bulk_films', url, False):
                     continue
@@ -4700,16 +5437,25 @@ async def cmd_megakino_last_added(update: Update, context: ContextTypes.DEFAULT_
             await msg.edit_text("❌ Kein 'Zuletzt hinzugefügt'-Block gefunden.")
             return
 
-        film_found = film_existing = film_queued = 0
+        film_found = film_existing = film_queued = film_upgrades = 0
         series_found = series_complete = series_queued = 0
 
         for item in items:
             if item['type'] == 'film':
                 film_found += 1
                 if _db_exists('film', item['title'], False):
-                    film_existing += 1
-                    continue
-                qmsg = await update.message.reply_text(f"📥 In Queue: {item['title']}")
+                    stored_source = _db_get_voe('film', item['title'], False)
+                    if stored_source:
+                        film_existing += 1
+                        continue
+                    film_upgrades += 1
+                    qmsg = await update.message.reply_text(
+                        f"♻️ Qualitäts-Upgrade in Queue: {item['title']}"
+                    )
+                else:
+                    qmsg = await update.message.reply_text(
+                        f"📥 In Queue: {item['title']}"
+                    )
                 await _enqueue(chat_id, qmsg, process_video,
                     {'type': 'video', 'url': item['url'], 'content_type': 'film', 'manual_title': item['title'], 'is_anime': False},
                     item['url'], 'film', item['title'], False)
@@ -4739,7 +5485,8 @@ async def cmd_megakino_last_added(update: Update, context: ContextTypes.DEFAULT_
 
         await msg.edit_text(
             "✅ Megakino Last Added geprüft.\n\n"
-            f"🎬 Filme: {film_found} gefunden, {film_existing} schon vorhanden, {film_queued} in Queue\n"
+            f"🎬 Filme: {film_found} gefunden, {film_existing} aktuell, "
+            f"{film_upgrades} Qualitäts-Upgrades, {film_queued} in Queue\n"
             f"📺 Serien: {series_found} gefunden, {series_complete} komplett, {series_queued} in Queue"
         )
     except Exception as e:
@@ -4758,16 +5505,25 @@ async def cmd_hdfilme_latest(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await msg.edit_text("❌ Keine HDFilme-Latest-Einträge gefunden.")
             return
 
-        film_found = film_existing = film_queued = 0
+        film_found = film_existing = film_queued = film_upgrades = 0
         series_found = series_complete = series_queued = 0
 
         for item in items:
             if item['type'] == 'film':
                 film_found += 1
                 if _db_exists('film', item['title'], False):
-                    film_existing += 1
-                    continue
-                qmsg = await update.message.reply_text(f"📥 HDFilme Film in Queue: {item['title']}")
+                    stored_source = _db_get_voe('film', item['title'], False)
+                    if stored_source:
+                        film_existing += 1
+                        continue
+                    film_upgrades += 1
+                    qmsg = await update.message.reply_text(
+                        f"♻️ HDFilme Qualitäts-Upgrade in Queue: {item['title']}"
+                    )
+                else:
+                    qmsg = await update.message.reply_text(
+                        f"📥 HDFilme Film in Queue: {item['title']}"
+                    )
                 await _enqueue(chat_id, qmsg, process_video,
                     {'type': 'video', 'url': item['url'], 'content_type': 'film', 'manual_title': None, 'is_anime': False},
                     item['url'], 'film', None, False)
@@ -4797,7 +5553,8 @@ async def cmd_hdfilme_latest(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         await msg.edit_text(
             "✅ HDFilme Latest geprüft.\n\n"
-            f"🎬 Filme: {film_found} gefunden, {film_existing} schon vorhanden, {film_queued} in Queue\n"
+            f"🎬 Filme: {film_found} gefunden, {film_existing} aktuell, "
+            f"{film_upgrades} Qualitäts-Upgrades, {film_queued} in Queue\n"
             f"📺 Serien: {series_found} gefunden, {series_complete} komplett, {series_queued} in Queue"
         )
     except Exception as e:
@@ -4816,7 +5573,7 @@ async def cmd_filmpalast_import(update: Update, context: ContextTypes.DEFAULT_TY
             await msg.edit_text("❌ Keine Filmpalast-Import-Einträge gefunden.")
             return
 
-        film_found = film_existing = film_queued = 0
+        film_found = film_existing = film_queued = film_upgrades = 0
         series_found = series_existing = series_queued = 0
         errors = 0
 
@@ -4825,11 +5582,25 @@ async def cmd_filmpalast_import(update: Update, context: ContextTypes.DEFAULT_TY
                 if item['type'] == 'film':
                     film_found += 1
                     db_title = f"{item['title']} ({item['year']})" if item.get('year') else item['title']
-                    if item.get('year') and _db_exists('film', db_title, False):
-                        film_existing += 1
-                        continue
+                    film_exists = bool(
+                        item.get('year')
+                        and _db_exists('film', db_title, False)
+                    )
+                    if film_exists:
+                        stored_source = _db_get_voe('film', db_title, False)
+                        if stored_source:
+                            film_existing += 1
+                            continue
+                        film_upgrades += 1
 
-                    qmsg = await update.message.reply_text(f"📥 Filmpalast Film in Queue: {item['title']}")
+                    queue_label = (
+                        "♻️ Filmpalast Qualitäts-Upgrade in Queue"
+                        if film_exists
+                        else "📥 Filmpalast Film in Queue"
+                    )
+                    qmsg = await update.message.reply_text(
+                        f"{queue_label}: {item['title']}"
+                    )
                     await _enqueue(chat_id, qmsg, process_video,
                         {'type': 'video', 'url': item['url'], 'content_type': 'filmpalast', 'manual_title': None, 'is_anime': False},
                         item['url'], 'filmpalast', None, False, "", True)
@@ -4853,7 +5624,8 @@ async def cmd_filmpalast_import(update: Update, context: ContextTypes.DEFAULT_TY
 
         text = (
             "✅ Filmpalast Import geprüft.\n\n"
-            f"🎬 Filme: {film_found} gefunden, {film_existing} schon vorhanden, {film_queued} in Queue\n"
+            f"🎬 Filme: {film_found} gefunden, {film_existing} aktuell, "
+            f"{film_upgrades} Qualitäts-Upgrades, {film_queued} in Queue\n"
             f"📺 Folgen: {series_found} gefunden, {series_existing} schon vorhanden, {series_queued} in Queue"
         )
         if errors:
@@ -5032,7 +5804,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         lines.append(f"{phase_icon} *{phase_text}*")
         lines.append(f"📄 `{filename}`")
-        lines.append(f"💾 {size_mb:.0f} MB")
+        if (
+            phase == 'download'
+            and _dl_status.get('progress_mode') == 'segments'
+            and _dl_status.get('segments_total')
+        ):
+            done = int(_dl_status.get('segments_done', 0))
+            total = int(_dl_status['segments_total'])
+            percent = int(_dl_status.get('percent', 0))
+            lines.append(f"💾 {percent}% · {done}/{total} Segmente")
+        else:
+            lines.append(f"💾 {size_mb:.0f} MB")
         lines.append(f"⏱ {m:02d}:{s:02d}")
     elif _dl_active:
         label = _queue_item_label(_dl_active.get('persist', {}))
@@ -5220,6 +6002,75 @@ async def cmd_manuel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Mit Spec wie `2 3,5-8` werden genau diese verlangt._",
         parse_mode='Markdown'
     )
+
+
+async def cmd_film_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Startet Titel→Player-URL-Dialog für einen manuellen Filmimport."""
+    context.user_data.pop('manuel', None)
+    context.user_data['manual_film_import'] = {'state': 'waiting_title'}
+    await update.message.reply_text(
+        "🎬 Film Import\n\n"
+        "Gib bitte den vollständigen Titel ein.\n"
+        "Beispiel: Inception (2018) Drama, Comedy"
+    )
+
+
+async def _handle_manual_film_import(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, film: dict
+) -> None:
+    text = update.message.text.strip()
+    state = film.get('state')
+
+    if state == 'waiting_title':
+        if not re.search(r'\(\d{4}\)', text):
+            await update.message.reply_text(
+                "❌ Im Titel fehlt das Jahr in Klammern.\n"
+                "Beispiel: Inception (2018) Drama, Comedy"
+            )
+            return
+        title = format_filename(text)
+        if not title:
+            await update.message.reply_text("❌ Der Titel darf nicht leer sein.")
+            return
+        film['title'] = title
+        film['state'] = 'waiting_url'
+        await update.message.reply_text(
+            f"✅ Titel gespeichert:\n{title}\n\n"
+            "Gib jetzt die direkte VOE- oder Doodstream-URL ein."
+        )
+        return
+
+    if state == 'waiting_url':
+        if not _is_direct_player_url(text):
+            await update.message.reply_text(
+                "❌ Keine unterstützte direkte Player-URL erkannt.\n"
+                "Bitte eine VOE- oder Doodstream-Seite senden."
+            )
+            return
+
+        context.user_data.pop('manual_film_import', None)
+        title = film['title']
+        chat_id = update.effective_chat.id
+        msg = await update.message.reply_text(
+            f"📥 Film wird in die Warteschlange gestellt:\n{title}"
+        )
+        await _enqueue(
+            chat_id,
+            msg,
+            process_video,
+            {
+                'type': 'video',
+                'url': text,
+                'content_type': 'film',
+                'manual_title': title,
+                'is_anime': False,
+                'chat_id': chat_id,
+            },
+            text,
+            'film',
+            title,
+            False,
+        )
 
 
 def _parse_episode_spec(spec: str, max_ep: int) -> list[int]:
@@ -5433,6 +6284,11 @@ async def _kinoger_handle_season(update: Update, context: ContextTypes.DEFAULT_T
 
 async def handle_manuel_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Prüft ob wir in einem manuellen Modus sind. Gibt True zurück wenn ja."""
+    film = context.user_data.get('manual_film_import')
+    if film:
+        await _handle_manual_film_import(update, context, film)
+        return True
+
     # Kinoger-Modus (Staffel-Wahl)
     kg = context.user_data.get('kinoger')
     if kg and kg.get('state') == 'waiting_season':
@@ -5604,12 +6460,14 @@ async def main():
     # erreicht dadurch weder Link-Queue noch Import-, Watchcheck- oder Buttons.
     app.add_handler(TypeHandler(Update, _enforce_chat_allowlist), group=-1)
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler(["cancel", "stop"], cmd_cancel))
     app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(CommandHandler("watchcheck", cmd_watchcheck))
     app.add_handler(CommandHandler("megakino_last_added", cmd_megakino_last_added))
     app.add_handler(CommandHandler("hdfilme_latest", cmd_hdfilme_latest))
     app.add_handler(CommandHandler("filmpalast_import", cmd_filmpalast_import))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("filmimport", cmd_film_import))
     app.add_handler(CommandHandler("manuel", cmd_manuel))
     app.add_handler(CommandHandler("centralserie", cmd_centralserie))
     app.add_handler(CommandHandler("remotequeue_download", cmd_remote_queue_download))
@@ -5628,12 +6486,14 @@ async def main():
         await app.start()
         await app.bot.set_my_commands([
             BotCommand("start", "Hauptmenü"),
+            BotCommand("cancel", "Offene Eingabe abbrechen"),
             BotCommand("queue", "📋 Warteschlange anzeigen & verwalten"),
             BotCommand("watchcheck", "🔍 Watchlist jetzt prüfen"),
             BotCommand("megakino_last_added", "🆕 Megakino Zuletzt hinzugefügt"),
             BotCommand("hdfilme_latest", "🆕 HDFilme neueste Filme/Serien"),
             BotCommand("filmpalast_import", "🆕 Filmpalast neue Filme/Folgen"),
             BotCommand("status", "📊 Aktueller Download-Status"),
+            BotCommand("filmimport", "🎬 Film manuell per Player-Link"),
             BotCommand("manuel", "✍️ Manuelle Serieneingabe (VOE-Links)"),
             BotCommand("centralserie", "☁️ Serie komplett in zentrale Queue"),
             BotCommand("remotequeue_download", "▶️ Remote Queue mit Chromium starten"),
