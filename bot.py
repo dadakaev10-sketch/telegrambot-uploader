@@ -3723,7 +3723,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Was ist es?", reply_markup=keyboard)
 
 
-async def process_video(msg, url: str, content_type: str, manual_title: str | None, is_anime: bool = False, progress_prefix: str = "", auto_skip_existing: bool = False):
+async def process_video(msg, url: str, content_type: str, manual_title: str | None,
+                        is_anime: bool = False, progress_prefix: str = "",
+                        auto_skip_existing: bool = False,
+                        direct_media_url: bool = False):
     """Verarbeitung als Background-Task"""
     type_emoji = {"film": "🎬", "serie": "📺", "anime": "🎌", "filmpalast": "🎬"}
 
@@ -3771,9 +3774,24 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
                 return False
             return True
 
-        # Stream abfangen (Playwright macht alles: Seite öffnen, iframe extrahieren, Play klicken)
-        # Gibt (stream_url, film_title, referer, cookie_str, source_voe_url) zurück
-        stream_url, playwright_title, referer, cookie_str, source_voe_url = await get_stream_url(url, content_type, early_db_check=_early_check)
+        # Einmalige, ausdrücklich markierte Direktdateien benötigen keinen
+        # Browser/Player. Normale Queue-Jobs bleiben weiterhin strikt VOE/Dood.
+        if direct_media_url:
+            from urllib.parse import urlsplit
+            parsed_direct = urlsplit(url)
+            stream_url = url
+            playwright_title = manual_title
+            referer = f"{parsed_direct.scheme}://{parsed_direct.netloc}/"
+            cookie_str = ""
+            source_voe_url = None
+            logging.info("Direkte Remote-Mediendatei wird ohne Player-Auflösung geladen")
+        else:
+            # Stream abfangen (Playwright macht alles: Seite öffnen, iframe
+            # extrahieren, Play klicken). Gibt Stream, Titel, Referer, Cookies
+            # und ursprüngliche Player-URL zurück.
+            stream_url, playwright_title, referer, cookie_str, source_voe_url = await get_stream_url(
+                url, content_type, early_db_check=_early_check
+            )
 
         # Early-Skip-Signal: war bereits in DB, kein VOE extrahiert → einfach skippen
         if cookie_str == "__DB_SKIP__" and playwright_title:
@@ -6786,7 +6804,8 @@ async def _restore_queue_job(app: Application, item_data: dict) -> None:
     else:
         await _enqueue(chat_id, msg, process_video, item_data,
                        item_data['url'], item_data['content_type'],
-                       item_data.get('manual_title'), item_data.get('is_anime', False), **common)
+                       item_data.get('manual_title'), item_data.get('is_anime', False),
+                       "", False, item_data.get('direct_media_url', False), **common)
 
 
 async def _central_queue_worker(app: Application) -> None:
