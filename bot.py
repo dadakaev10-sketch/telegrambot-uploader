@@ -198,10 +198,10 @@ logging.info(f"Telethon-Session: {_TG_SESSION_NAME}.session")
 MAIN_MENU = ReplyKeyboardMarkup(
     [
         ["▶️ Remote Queue Download", "🗑 Remote Queue leeren"],
-        ["⚡ Serie vorreihen", "🎬 Film Import"],
+        ["⚡ URL vorreihen", "🎬 Film Import"],
         ["🆕 Megakino Last Added", "🆕 HDFilme Latest"],
         ["🆕 Filmpalast Import", "📊 Status"],
-        ["🔍 Watchcheck", "📋 Queue"],
+        ["🔍 Watchcheck", "📋 Remote Queue"],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -209,6 +209,7 @@ MAIN_MENU = ReplyKeyboardMarkup(
 MAIN_MENU_TEXTS = {
     "▶️ Remote Queue Download",
     "🗑 Remote Queue leeren",
+    "⚡ URL vorreihen",
     "⚡ Serie vorreihen",
     "🎬 Film Import",
     "🆕 Megakino Last Added",
@@ -216,7 +217,7 @@ MAIN_MENU_TEXTS = {
     "🆕 Filmpalast Import",
     "📊 Status",
     "🔍 Watchcheck",
-    "📋 Queue",
+    "📋 Remote Queue",
 }
 
 
@@ -2967,13 +2968,164 @@ def _central_source_url_is_valid(source_url: str | None, page_url: str) -> bool:
     return source_url.rstrip('/') != page_url.rstrip('/')
 
 
-async def _extract_central_series(
-    app: Application, chat_id: int, series_url: str, priority: int = 0
+def _is_remote_player_source_url(url: str | None) -> bool:
+    """Erlaubt in PostgreSQL ausschließlich VOE-/Doodstream-Playerseiten.
+
+    Beide Dienste verwenden neben ihren Hauptdomains wechselnde Aliasdomains.
+    Der stabile Teil ist der Playerpfad /e/ bzw. /d/. Generische /embed/- oder
+    kurzlebige CDN-/m3u8-/MP4-Adressen werden bewusst nicht veröffentlicht.
+    """
+    if not url or not url.startswith(('http://', 'https://')):
+        return False
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    host = (parsed.hostname or '').lower()
+    return (
+        bool(re.match(r'^/(?:e|d)/[^/]+/?$', path))
+        or ('voe.' in host and bool(path.strip('/')))
+        or ('dood' in host and bool(path.strip('/')))
+    )
+
+
+async def _publish_remote_video(
+    msg,
+    persist: dict,
 ) -> None:
-    prefix = "⚡ Priorisierte Serie\n" if priority else ""
-    msg = await app.bot.send_message(chat_id, prefix + "🔎 Lese Staffeln und Folgen …")
+    """Löst eine Seite auf und veröffentlicht nur den direkten Playerlink."""
+    page_url = persist.get('url', '').strip()
+    content_type = persist.get('content_type') or 'film'
+    is_anime = bool(persist.get('is_anime'))
+    priority = int(persist.get('priority', 0) or 0)
+    if priority:
+        priority = await asyncio.to_thread(_central_queue.next_front_priority)
+
     try:
-        series_title, episodes = await get_series_episodes(series_url, False)
+        if _is_remote_player_source_url(page_url):
+            source_url = page_url
+            detected_title = None
+        else:
+            await msg.edit_text("🦊 Extrahiere VOE-/Doodstream-Link …")
+            _stream, detected_title, _referer, _cookies, source_url = await get_stream_url(
+                page_url,
+                content_type,
+                source_only=True,
+            )
+        if not _is_remote_player_source_url(source_url):
+            raise RuntimeError(
+                "Kein VOE-/Doodstream-Playerlink gefunden; der Auftrag wurde "
+                "nicht in die Remote Queue geschrieben"
+            )
+
+        is_fp_series = content_type == 'filmpalast' and _is_filmpalast_series(page_url)
+        db_type = (
+            'anime' if is_anime
+            else 'serie' if content_type == 'serie' or is_fp_series
+            else 'film'
+        )
+        title = persist.get('manual_title') or detected_title
+        if not title:
+            title = scrape_title(page_url)
+        title = format_filename(title)
+        payload = {
+            'type': 'video',
+            'url': source_url,
+            'content_type': db_type,
+            'manual_title': title,
+            'is_anime': is_anime,
+            'chat_id': persist.get('chat_id'),
+            'priority': priority,
+        }
+        job_id, created = await asyncio.to_thread(_central_queue.enqueue, payload)
+        position_hint = "ganz vorne" if priority else "ganz hinten"
+        await msg.edit_text(
+            f"{'✅' if created else 'ℹ️'} Remote Queue #{job_id} ({position_hint})\n"
+            f"{title}\n{source_url}"
+        )
+    except Exception as error:
+        logging.error("Remote-Player-Extraktion fehlgeschlagen:\n%s", traceback.format_exc())
+        await msg.edit_text(f"❌ Remote-Queue-Extraktion fehlgeschlagen: {error}")
+
+
+async def _extract_central_bulk(
+    app: Application,
+    chat_id: int,
+    listing_url: str,
+    priority: int = 0,
+    status_msg=None,
+) -> None:
+    """Extrahiert eine Film-Liste ohne lokale Downloads in die Remote Queue."""
+    msg = status_msg or await app.bot.send_message(
+        chat_id, "🔎 Lese Film-Liste für Remote Queue …"
+    )
+    if status_msg:
+        await msg.edit_text("🔎 Lese Film-Liste für Remote Queue …")
+    try:
+        film_urls = await get_bulk_films_from_page(listing_url)
+        if not film_urls:
+            await msg.edit_text("❌ Keine Filme in der Liste gefunden.")
+            return
+        created = existing = failed = 0
+        # Bei „vorreihen“ in umgekehrter Reihenfolge veröffentlichen, damit die
+        # erste sichtbare URL auch nach mehreren Front-Einfügungen vorne bleibt.
+        ordered_urls = list(reversed(film_urls)) if priority else film_urls
+        for index, film_url in enumerate(ordered_urls, 1):
+            try:
+                _stream, detected_title, _ref, _cookies, source_url = await get_stream_url(
+                    film_url, 'film', source_only=True
+                )
+                if not _is_remote_player_source_url(source_url):
+                    raise RuntimeError('kein VOE-/Doodstream-Link')
+                payload_priority = (
+                    await asyncio.to_thread(_central_queue.next_front_priority)
+                    if priority else 0
+                )
+                payload = {
+                    'type': 'video',
+                    'url': source_url,
+                    'content_type': 'film',
+                    'manual_title': format_filename(detected_title or scrape_title(film_url)),
+                    'is_anime': False,
+                    'chat_id': chat_id,
+                    'priority': payload_priority,
+                }
+                _job_id, was_created = await asyncio.to_thread(
+                    _central_queue.enqueue, payload
+                )
+                created += int(was_created)
+                existing += int(not was_created)
+            except Exception as error:
+                failed += 1
+                logging.warning("Remote-Bulk-Eintrag fehlgeschlagen (%s): %s", film_url, error)
+            if index % 5 == 0 or index == len(ordered_urls):
+                await msg.edit_text(
+                    f"🦊 Remote-Liste: {index}/{len(ordered_urls)} geprüft\n"
+                    f"☁️ Neu: {created} · vorhanden: {existing} · Fehler: {failed}"
+                )
+        await msg.edit_text(
+            f"✅ Film-Liste abgeschlossen\n"
+            f"☁️ Neu: {created} · vorhanden: {existing} · Fehler: {failed}"
+        )
+    except Exception as error:
+        logging.error("Remote-Bulk-Extraktion fehlgeschlagen:\n%s", traceback.format_exc())
+        await msg.edit_text(f"❌ Film-Listen-Extraktion fehlgeschlagen: {error}")
+
+
+async def _extract_central_series(
+    app: Application, chat_id: int, series_url: str, priority: int = 0,
+    is_anime: bool = False,
+    status_msg=None,
+) -> None:
+    if priority:
+        priority = await asyncio.to_thread(_central_queue.next_front_priority)
+    prefix = "⚡ Priorisierte Serie\n" if priority else ""
+    msg = status_msg or await app.bot.send_message(
+        chat_id, prefix + "🔎 Lese Staffeln und Folgen …"
+    )
+    if status_msg:
+        await msg.edit_text(prefix + "🔎 Lese Staffeln und Folgen …")
+    try:
+        series_title, episodes = await get_series_episodes(series_url, is_anime)
         missing = [ep for ep in episodes if not ep.get('skip')]
         if not missing:
             await msg.edit_text(f"✅ {series_title}: Alle Folgen sind bereits vorhanden.")
@@ -2988,12 +3140,16 @@ async def _extract_central_series(
         incomplete_seasons = 0
         deferred_total = 0
         for season, season_episodes in sorted(seasons.items()):
+            season_priority = priority - int(season) if priority else 0
             season_episodes.sort(key=lambda ep: int(ep.get('episode', 0)))
-            source_key = f"series:{series_url.rstrip('/').lower()}:season:{season}"
+            source_key = (
+                f"series:{'anime' if is_anime else 'serie'}:"
+                f"{series_url.rstrip('/').lower()}:season:{season}"
+            )
             batch_title = f"{series_title} – Staffel {season}"
             if priority:
                 promoted = await asyncio.to_thread(
-                    _central_queue.promote_source_jobs, source_key, priority
+                    _central_queue.promote_source_jobs, source_key, season_priority
                 )
                 if promoted:
                     logging.info(
@@ -3054,20 +3210,25 @@ async def _extract_central_series(
                             markdown=True,
                         )
                     try:
-                        extraction_type = episode.get('content_type') or 'serie'
+                        extraction_type = episode.get('content_type') or (
+                            'anime' if is_anime else 'serie'
+                        )
                         _stream, _title, _referer, _cookies, source_url = await get_stream_url(
                             episode['url'], extraction_type, source_only=True
                         )
-                        if not _central_source_url_is_valid(source_url, episode['url']):
+                        if (
+                            not _central_source_url_is_valid(source_url, episode['url'])
+                            or not _is_remote_player_source_url(source_url)
+                        ):
                             raise RuntimeError(f"Keine gültige VOE-/Doodstream-URL für {title}")
                         payload = {
                             'type': 'video',
                             'url': source_url,
-                            'content_type': 'serie',
+                            'content_type': 'anime' if is_anime else 'serie',
                             'manual_title': title,
-                            'is_anime': False,
+                            'is_anime': is_anime,
                             'chat_id': chat_id,
-                            'priority': priority,
+                            'priority': season_priority,
                         }
                         _job_id, created = await asyncio.to_thread(
                             _central_queue.enqueue_batch_job, batch_id, payload
@@ -3154,17 +3315,27 @@ async def _extract_central_single(
     app: Application, chat_id: int, page_url: str, selected_type: str,
     priority: int = 0,
 ) -> None:
+    if priority:
+        priority = await asyncio.to_thread(_central_queue.next_front_priority)
     msg = await app.bot.send_message(chat_id, "🦊 Extrahiere Player-Link …")
     try:
         is_fp = _is_filmpalast_film(page_url) or _is_filmpalast_series(page_url)
         extraction_type = 'filmpalast' if is_fp else selected_type
-        _stream, detected_title, _referer, _cookies, source_url = await get_stream_url(
-            page_url, extraction_type, source_only=True
-        )
-        if not _central_source_url_is_valid(source_url, page_url):
+        if _is_remote_player_source_url(page_url):
+            source_url = page_url
+            detected_title = None
+        else:
+            _stream, detected_title, _referer, _cookies, source_url = await get_stream_url(
+                page_url, extraction_type, source_only=True
+            )
+        if not _is_remote_player_source_url(source_url):
             raise RuntimeError("Keine gültige VOE-/Doodstream-URL gefunden")
 
-        db_type = 'serie' if selected_type == 'serie' else 'film'
+        db_type = (
+            'anime' if selected_type == 'anime'
+            else 'serie' if selected_type == 'serie'
+            else 'film'
+        )
         title = detected_title
         if not title:
             slug = page_url.rstrip('/').split('/')[-1]
@@ -3175,7 +3346,7 @@ async def _extract_central_single(
             'url': source_url,
             'content_type': db_type,
             'manual_title': title,
-            'is_anime': False,
+            'is_anime': selected_type == 'anime',
             'chat_id': chat_id,
             'priority': priority,
         }
@@ -3199,28 +3370,39 @@ async def _start_central_url(
         return
 
     url = _normalize_seriesstream_url(url.strip())
-    if not _is_seriesstream_url(url):
-        await update.message.reply_text(
-            "❌ Diese Funktion ist ausschließlich für SerienStream-Links.\n"
-            "Filmpalast, Megakino und AniWorld laufen weiterhin normal über Chromium."
-        )
-        return
+    is_anime = 'aniworld.to' in url
+    is_series_collection = (
+        (_is_seriesstream_url(url) and '/episode-' not in url)
+        or (is_anime and '/episode-' not in url)
+        or bool(re.search(r'/serials?/', url, re.IGNORECASE))
+    )
 
-    if '/episode-' in url:
+    if is_series_collection:
+        _spawn_task(
+            _extract_central_series(
+                context.application,
+                chat_id,
+                url,
+                priority,
+                is_anime,
+            ),
+            f'central-series-{chat_id}',
+        )
+    else:
+        selected_type = (
+            'anime' if is_anime
+            else 'serie' if '/episode-' in url or _is_filmpalast_series(url)
+            else 'film'
+        )
         _spawn_task(
             _extract_central_single(
-                context.application, chat_id, url, 'serie', priority
+                context.application, chat_id, url, selected_type, priority
             ),
             f'central-single-{chat_id}',
         )
-    else:
-        _spawn_task(
-            _extract_central_series(context.application, chat_id, url, priority),
-            f'central-series-{chat_id}',
-        )
     await update.message.reply_text(
-        ("⚡ Serie wird vor allen wartenden Jobs eingereiht.\n" if priority else "") +
-        "🦊 Camoufox extrahiert nur die VOE-Links und legt sie in die Remote Queue."
+        ("⚡ Auftrag wird an die erste Remote-Queue-Position gesetzt.\n" if priority else "") +
+        "🦊 Der Playerlink wird zuerst extrahiert; nur VOE/Doodstream kommt in PostgreSQL."
     )
 
 
@@ -3346,11 +3528,12 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "🗑 Remote Queue leeren":
         await cmd_clear_remote_queue(update, context)
         return
-    if text == "⚡ Serie vorreihen":
+    if text in ("⚡ URL vorreihen", "⚡ Serie vorreihen"):
         context.user_data['priority_series_waiting_url'] = True
         await update.message.reply_text(
-            "⚡ Sende jetzt die SerienStream-URL. Die Serie wird vor allen "
-            "normal wartenden Remote-Jobs eingeordnet."
+            "⚡ Sende jetzt die URL. Nach der VOE-/Doodstream-Extraktion wird "
+            "der Film beziehungsweise der gesamte Staffelblock an die erste "
+            "Position der Remote Queue gesetzt."
         )
         return
     if text == "🎬 Film Import":
@@ -3359,8 +3542,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "▶️ Start":
         await cmd_start(update, context)
         return
-    if text == "📋 Queue":
-        await cmd_queue(update, context)
+    if text == "📋 Remote Queue":
+        await cmd_remote_queue_positions(update, context)
         return
     if text == "📊 Status":
         await cmd_status(update, context)
@@ -3379,6 +3562,16 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if text == "✍️ Manuel":
         await cmd_manuel(update, context)
+        return
+
+    priority_match = re.match(r'^vorreihen\s+(https?://\S+)$', text, re.IGNORECASE)
+    if priority_match:
+        await _start_central_url(
+            update,
+            context,
+            priority_match.group(1),
+            priority=100,
+        )
         return
 
     if not text.startswith('http'):
@@ -4833,16 +5026,54 @@ async def _enqueue(chat_id: int, msg, coro_func, persist: dict, *coro_args,
     elif persist.get('type') == 'bulk_films':
         _watchlist_add('bulk_films', persist['url'], chat_id, False)
 
-    # Producer-Bots schreiben nur nach PostgreSQL. Sie laden selbst nichts und
-    # verändern ihre lokale queue.json nicht. Worker-Jobs tragen bereits eine
-    # Claim-ID und werden deshalb nicht erneut veröffentlicht.
-    if CENTRAL_QUEUE_ROLE == 'producer' and not persist.get('_central_job_id'):
-        job_id, created = await asyncio.to_thread(_central_queue.enqueue, persist)
-        label = _queue_item_label(persist)
-        if created:
-            await msg.edit_text(f"☁️ Zentrale Queue #{job_id}: {label}")
+    # Der lokale Bot und explizite Producer sind reine Link-Produzenten:
+    # keine neuen lokalen Downloads, kein queue.json-Eintrag. Erst wird die
+    # Quellseite auf VOE/Doodstream aufgelöst, danach kommt nur der Playerlink
+    # in PostgreSQL. Vom Worker reservierte Jobs tragen eine Claim-ID und
+    # durchlaufen weiterhin den normalen Downloadpfad darunter.
+    if (
+        CENTRAL_QUEUE_ROLE in ('local', 'producer')
+        and not persist.get('_central_job_id')
+    ):
+        if not _central_queue:
+            await msg.edit_text("❌ DATABASE_URL fehlt; Remote Queue nicht verfügbar.")
+            return
+        job_type = persist.get('type')
+        priority = int(persist.get('priority', 0) or 0)
+        if job_type == 'series':
+            await msg.edit_text("🦊 Serie wird extrahiert und in Remote Queue veröffentlicht …")
+            _spawn_task(
+                _extract_central_series(
+                    None,
+                    chat_id,
+                    persist['url'],
+                    priority,
+                    bool(persist.get('is_anime')),
+                    msg,
+                ),
+                f"remote-series-{chat_id}-{id(msg)}",
+            )
+        elif job_type == 'bulk_films':
+            _spawn_task(
+                _extract_central_bulk(
+                    None,
+                    chat_id,
+                    persist['url'],
+                    priority,
+                    msg,
+                ),
+                f"remote-bulk-{chat_id}-{id(msg)}",
+            )
+        elif job_type == 'kinoger_direct':
+            await msg.edit_text(
+                "❌ Kinoger liefert hier keinen VOE-/Doodstream-Playerlink. "
+                "Nach deiner Remote-Queue-Regel wurde nichts eingereiht."
+            )
         else:
-            await msg.edit_text(f"ℹ️ Bereits in zentraler Queue #{job_id}: {label}")
+            _spawn_task(
+                _publish_remote_video(msg, dict(persist)),
+                f"remote-video-{chat_id}-{id(msg)}",
+            )
         return
     item = {
         'chat_id': chat_id, 'msg': msg, 'coro': coro_func,
@@ -5059,6 +5290,156 @@ def _queue_item_already_done(persist: dict) -> bool:
     return _db_exists(content_type, title, bool(persist.get('is_anime')))
 
 
+def _remote_queue_groups(jobs: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Bündelt offene Remote-Jobs für die Anzeige nach Serie und Staffel."""
+    processing = [job for job in jobs if job.get('status') == 'processing']
+    queued = [job for job in jobs if job.get('status') == 'queued']
+    groups: list[dict] = []
+    indexes: dict[tuple, int] = {}
+
+    for job in queued:
+        key = CentralQueue._queue_group_key(job)
+        if key not in indexes:
+            indexes[key] = len(groups)
+            groups.append({'key': key, 'jobs': []})
+        groups[indexes[key]]['jobs'].append(job)
+
+    for group in groups:
+        group_jobs = group['jobs']
+        first = group_jobs[0]
+        payload = first.get('payload') or {}
+        titles = [
+            (job.get('payload') or {}).get('manual_title') or ''
+            for job in group_jobs
+        ]
+        episode_numbers = []
+        season_number = None
+        series_title = None
+        for title in titles:
+            match = re.match(
+                r'^(.*?)\s+S(\d{1,3})E(\d{1,4})(?:\b|\s)',
+                title,
+                re.IGNORECASE,
+            )
+            if match:
+                series_title = series_title or match.group(1).strip()
+                season_number = season_number or int(match.group(2))
+                episode_numbers.append(int(match.group(3)))
+
+        batch_title = first.get('batch_title')
+        if batch_title:
+            label = str(batch_title).replace(' – ', ' · ')
+        elif series_title is not None and season_number is not None:
+            emoji = '🎌' if payload.get('is_anime') else '📺'
+            label = f"{emoji} {series_title} · Staffel {season_number}"
+        else:
+            label = _queue_item_label(payload)
+
+        if len(group_jobs) > 1:
+            label += f" · {len(group_jobs)} Folgen"
+        if episode_numbers:
+            first_ep, last_ep = min(episode_numbers), max(episode_numbers)
+            if first_ep == last_ep:
+                label += f" · E{first_ep:02d}"
+            else:
+                label += f" · E{first_ep:02d}–E{last_ep:02d}"
+        group.update({
+            'anchor_id': int(first['id']),
+            'label': label,
+            'count': len(group_jobs),
+        })
+    return processing, groups
+
+
+async def _remote_queue_view(page: int = 0) -> tuple[str, InlineKeyboardMarkup | None]:
+    if not _central_queue:
+        return "❌ DATABASE_URL fehlt.", None
+    jobs = await asyncio.to_thread(_central_queue.open_jobs, 500)
+    processing, groups = _remote_queue_groups(jobs)
+    if not processing and not groups:
+        return "✅ Remote Queue ist leer.", None
+
+    page_size = 8
+    page_count = max(1, (len(groups) + page_size - 1) // page_size)
+    page = max(0, min(int(page), page_count - 1))
+    start = page * page_size
+    visible = groups[start:start + page_size]
+
+    lines = [
+        f"📋 Remote Queue · {len(groups)} Positionen · {len(jobs)} Jobs",
+    ]
+    if processing:
+        active_labels = ', '.join(
+            _queue_item_label(job.get('payload') or {})
+            for job in processing[:3]
+        )
+        lines.append(f"▶️ Aktiv: {active_labels}")
+        if len(processing) > 3:
+            lines.append(f"   + {len(processing) - 3} weitere aktive Jobs")
+    lines.append('')
+    for offset, group in enumerate(visible, start + 1):
+        lines.append(f"{offset}. {group['label']}")
+
+    keyboard: list[list[InlineKeyboardButton]] = []
+    for offset, group in enumerate(visible, start + 1):
+        anchor = group['anchor_id']
+        keyboard.append([
+            InlineKeyboardButton(f"⏫ {offset}", callback_data=f"rqmv:front:{anchor}:{page}"),
+            InlineKeyboardButton("⬆️", callback_data=f"rqmv:up:{anchor}:{page}"),
+            InlineKeyboardButton("⬇️", callback_data=f"rqmv:down:{anchor}:{page}"),
+            InlineKeyboardButton("⏬", callback_data=f"rqmv:back:{anchor}:{page}"),
+        ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ Zurück", callback_data=f"rqpage:{page - 1}"))
+    nav.append(InlineKeyboardButton("🔄 Aktualisieren", callback_data=f"rqpage:{page}"))
+    if page + 1 < page_count:
+        nav.append(InlineKeyboardButton("Weiter ▶️", callback_data=f"rqpage:{page + 1}"))
+    keyboard.append(nav)
+    lines.append('')
+    lines.append(f"Seite {page + 1}/{page_count} · ⏫ ganz vorne · ⏬ ganz hinten")
+    return '\n'.join(lines), InlineKeyboardMarkup(keyboard)
+
+
+async def cmd_remote_queue_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, markup = await _remote_queue_view(0)
+    await update.message.reply_text(text, reply_markup=markup)
+
+
+async def handle_remote_queue_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    page = 0
+    if query.data.startswith('rqpage:'):
+        page = int(query.data.split(':', 1)[1])
+    else:
+        _prefix, action, anchor_text, page_text = query.data.split(':', 3)
+        page = int(page_text)
+        result = await asyncio.to_thread(
+            _central_queue.reorder_group,
+            int(anchor_text),
+            action,
+        )
+        if result is None:
+            logging.info(
+                "Remote-Queue-Eintrag #%s konnte nicht mehr verschoben werden",
+                anchor_text,
+            )
+        elif action == 'front':
+            page = 0
+        elif action == 'back':
+            jobs = await asyncio.to_thread(_central_queue.open_jobs, 500)
+            _processing, groups = _remote_queue_groups(jobs)
+            page = max(0, (len(groups) - 1) // 8)
+
+    text, markup = await _remote_queue_view(page)
+    try:
+        await query.edit_message_text(text, reply_markup=markup)
+    except TgBadRequest as error:
+        if "Message is not modified" not in str(error):
+            raise
+
+
 async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Zeigt aktuelle Warteschlange mit Abbrechen-Buttons."""
     drafts = await asyncio.to_thread(_central_queue.collecting_batches) if _central_queue else []
@@ -5067,19 +5448,13 @@ async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for batch in drafts
     ]
     if CENTRAL_QUEUE_ROLE == 'producer':
-        jobs = await asyncio.to_thread(_central_queue.open_jobs)
-        if not jobs and not drafts:
-            await update.message.reply_text("✅ Zentrale Warteschlange ist leer.")
-            return
-        lines = []
-        for job in jobs:
-            marker = '▶️' if job['status'] == 'processing' else '☁️'
-            lines.append(f"{marker} *#{job['id']}* {_queue_item_label(job['payload'])}")
-        sections = lines + (["\n🧩 *Noch in Extraktion:*", *draft_lines] if draft_lines else [])
-        await update.message.reply_text(
-            "📋 *Zentrale PostgreSQL-Warteschlange:*\n" + "\n".join(sections),
-            parse_mode='Markdown',
-        )
+        await cmd_remote_queue_positions(update, context)
+        if drafts:
+            await update.message.reply_text(
+                "🧩 Noch in Extraktion:\n" + "\n".join(
+                    line.replace('*', '') for line in draft_lines
+                )
+            )
         return
     if not _dl_pending and not drafts:
         await update.message.reply_text("✅ Warteschlange ist leer.")
@@ -5204,6 +5579,20 @@ async def _watchlist_check_once(app, notify_empty: bool = False, manual_chat_id:
         is_anime = bool(entry.get('is_anime', False))
         chat_id = manual_chat_id or entry.get('chat_id')
         if not url or not chat_id:
+            continue
+
+        # Der Watchcheck ist bewusst auf diese beiden Quellen begrenzt:
+        # normale Serien von SerienStream und Anime von AniWorld. Andere
+        # gespeicherte Watchlist-Einträge bleiben erhalten, werden aber weder
+        # aufgerufen noch automatisch in eine Queue gelegt.
+        supported_watch_source = (
+            entry_type == 'series'
+            and (
+                (not is_anime and _is_seriesstream_url(url))
+                or (is_anime and 'aniworld.to' in url)
+            )
+        )
+        if not supported_watch_source:
             continue
 
         checked_items += 1
@@ -5381,21 +5770,6 @@ async def _watchlist_check_once(app, notify_empty: bool = False, manual_chat_id:
                         f"Staffel {', '.join(map(str, seasons_to_check))} in die Queue gelegt."
                     )
                     added_jobs += queued_total
-            elif entry_type == 'bulk_films':
-                if _watchlist_job_exists('bulk_films', url, False):
-                    continue
-                films = await get_bulk_films_from_page(url)
-                if not films:
-                    continue
-                msg = await app.bot.send_message(
-                    chat_id,
-                    f"🆕 Watchlist: Listing erneut geprüft. Füge Seite zur Queue hinzu...\n`{url}`",
-                    parse_mode='Markdown'
-                )
-                await _enqueue(chat_id, msg, process_bulk_films,
-                    {'type': 'bulk_films', 'url': url},
-                    url)
-                added_jobs += 1
         except Exception:
             logging.warning(f"Watchlist-Check Fehler für {url}:\n{traceback.format_exc()}")
 
@@ -6470,6 +6844,7 @@ async def main():
     app.add_handler(CommandHandler("filmimport", cmd_film_import))
     app.add_handler(CommandHandler("manuel", cmd_manuel))
     app.add_handler(CommandHandler("centralserie", cmd_centralserie))
+    app.add_handler(CommandHandler("remotequeue", cmd_remote_queue_positions))
     app.add_handler(CommandHandler("remotequeue_download", cmd_remote_queue_download))
     app.add_handler(CommandHandler("remotequeue_clear", cmd_clear_remote_queue))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
@@ -6478,6 +6853,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(handle_reupload, pattern="^reupload_"))
     app.add_handler(CallbackQueryHandler(handle_cancel_queue, pattern="^cancel_queue_"))
     app.add_handler(CallbackQueryHandler(handle_clear_remote_queue, pattern="^clear_remote_queue_"))
+    app.add_handler(CallbackQueryHandler(handle_remote_queue_positions, pattern="^rq(?:mv|page):"))
     app.add_handler(CallbackQueryHandler(handle_central_type, pattern="^central_type_"))
 
     print("🤖 Bot läuft!")
@@ -6496,6 +6872,7 @@ async def main():
             BotCommand("filmimport", "🎬 Film manuell per Player-Link"),
             BotCommand("manuel", "✍️ Manuelle Serieneingabe (VOE-Links)"),
             BotCommand("centralserie", "☁️ Serie komplett in zentrale Queue"),
+            BotCommand("remotequeue", "📋 Remote Queue anzeigen & sortieren"),
             BotCommand("remotequeue_download", "▶️ Remote Queue mit Chromium starten"),
             BotCommand("remotequeue_clear", "🗑 Wartende Remote Queue leeren"),
         ])
@@ -6509,6 +6886,16 @@ async def main():
                 await _restore_queue_job(app, item_data)
             except Exception as e:
                 logging.error(f"Queue-Wiederherstellung Fehler: {e}")
+        if saved and CENTRAL_QUEUE_ROLE == 'local':
+            # _restore_queue_job hat jeden Alt-Eintrag an den neuen
+            # Extraktions-/PostgreSQL-Pfad übergeben. Die lokale Datei darf
+            # danach nicht bei jedem Neustart dieselben URLs erneut starten.
+            _persist_queue('legacy-local-queue-migrated-to-remote')
+            logging.info(
+                "%s alte lokale Queue-Einträge zur Remote-Extraktion übergeben; "
+                "queue.json geleert",
+                len(saved),
+            )
 
         if CENTRAL_QUEUE_ROLE == 'worker' and CENTRAL_QUEUE_AUTOSTART:
             global _central_worker_task

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import timedelta
 
 import psycopg
@@ -56,6 +57,30 @@ ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAUL
 ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
 ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
 ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS batch_id BIGINT REFERENCES download_batches(id);
+ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS queue_position BIGINT;
+
+-- Bestehende Jobs einmalig in ihrer bisherigen effektiven Reihenfolge
+-- nummerieren. Danach kann die Reihenfolge unabhängig von IDs gespeichert
+-- und über den Telegram-Bot verändert werden.
+WITH ranked AS (
+    SELECT id,
+           row_number() OVER (
+               ORDER BY
+                   CASE
+                       WHEN payload->>'priority' ~ '^-?[0-9]+$'
+                       THEN (payload->>'priority')::integer
+                       ELSE 0
+                   END DESC,
+                   available_at,
+                   id
+           ) * 1000 AS position
+    FROM download_jobs
+    WHERE queue_position IS NULL
+)
+UPDATE download_jobs AS job
+SET queue_position=ranked.position
+FROM ranked
+WHERE job.id=ranked.id;
 
 -- Ältere Versionen hatten eine globale UNIQUE-Constraint auf dedupe_key.
 -- Dadurch konnten abgeschlossene oder abgebrochene Jobs nie erneut eingestellt
@@ -65,6 +90,8 @@ ALTER TABLE download_jobs DROP CONSTRAINT IF EXISTS download_jobs_dedupe_key_key
 
 CREATE INDEX IF NOT EXISTS download_jobs_claim_idx
     ON download_jobs (status, available_at, id);
+CREATE INDEX IF NOT EXISTS download_jobs_queue_position_idx
+    ON download_jobs (status, queue_position, id);
 CREATE UNIQUE INDEX IF NOT EXISTS download_jobs_open_dedupe_uq
     ON download_jobs (dedupe_key)
     WHERE status IN ('queued', 'processing');
@@ -79,9 +106,37 @@ class CentralQueue:
     def connect(self):
         return psycopg.connect(self.database_url, connect_timeout=10, row_factory=dict_row)
 
+    @staticmethod
+    def _append_position(con) -> int:
+        """Reserviert unter Transaktions-Lock eine Position am Queue-Ende."""
+        con.execute("SELECT pg_advisory_xact_lock(hashtext('download_jobs_queue_order'))")
+        row = con.execute(
+            "SELECT COALESCE(max(queue_position),0)+1000 AS position FROM download_jobs"
+        ).fetchone()
+        return int(row['position'])
+
     def init(self) -> None:
         with self.connect() as con:
             con.execute(SCHEMA_SQL)
+
+    def next_front_priority(self) -> int:
+        """Reserviert eine Priorität oberhalb aller momentan offenen Jobs."""
+        with self.connect() as con:
+            con.execute("SELECT pg_advisory_xact_lock(hashtext('download_jobs_front_priority'))")
+            row = con.execute(
+                """
+                SELECT COALESCE(max(
+                    CASE
+                        WHEN payload->>'priority' ~ '^-?[0-9]+$'
+                        THEN (payload->>'priority')::integer
+                        ELSE 0
+                    END
+                ),0)+1000 AS priority
+                FROM download_jobs
+                WHERE status IN ('queued','processing')
+                """
+            ).fetchone()
+            return int(row['priority'])
 
     @staticmethod
     def dedupe_key(payload: dict) -> str:
@@ -111,9 +166,10 @@ class CentralQueue:
                         (json.dumps({'priority': int(clean_payload['priority'])}), existing['id']),
                     )
                 return existing['id'], False
+            position = self._append_position(con)
             row = con.execute(
-                "INSERT INTO download_jobs(dedupe_key,payload) VALUES (%s,%s::jsonb) RETURNING id",
-                (key, json.dumps(clean_payload, ensure_ascii=False)),
+                "INSERT INTO download_jobs(dedupe_key,payload,queue_position) VALUES (%s,%s::jsonb,%s) RETURNING id",
+                (key, json.dumps(clean_payload, ensure_ascii=False), position),
             ).fetchone()
             return row['id'], True
 
@@ -138,9 +194,10 @@ class CentralQueue:
                         )
                     existing += 1
                     continue
+                position = self._append_position(con)
                 con.execute(
-                    "INSERT INTO download_jobs(dedupe_key,payload) VALUES (%s,%s::jsonb)",
-                    (key, json.dumps(clean, ensure_ascii=False)),
+                    "INSERT INTO download_jobs(dedupe_key,payload,queue_position) VALUES (%s,%s::jsonb,%s)",
+                    (key, json.dumps(clean, ensure_ascii=False), position),
                 )
                 created += 1
         return {'created': created, 'existing': existing}
@@ -220,19 +277,41 @@ class CentralQueue:
                         (json.dumps({'priority': int(clean['priority'])}), row['id']),
                     )
                 return row['id'], False
+            position = self._append_position(con)
             row = con.execute(
-                "INSERT INTO download_jobs(dedupe_key,payload,batch_id) VALUES (%s,%s::jsonb,%s) RETURNING id",
-                (key, json.dumps(clean, ensure_ascii=False), batch_id),
+                "INSERT INTO download_jobs(dedupe_key,payload,batch_id,queue_position) VALUES (%s,%s::jsonb,%s,%s) RETURNING id",
+                (key, json.dumps(clean, ensure_ascii=False), batch_id, position),
             ).fetchone()
             con.execute("UPDATE download_batches SET updated_at=now() WHERE id=%s", (batch_id,))
             return row['id'], True
 
     def release_batch(self, batch_id: int) -> int:
         with self.connect() as con:
+            con.execute("SELECT pg_advisory_xact_lock(hashtext('download_jobs_queue_order'))")
             count = con.execute(
                 "SELECT count(*) AS n FROM download_jobs WHERE batch_id=%s AND status='queued'",
                 (batch_id,),
             ).fetchone()['n']
+            # Parallele Extraktion kann Links in zufälliger Reihenfolge liefern.
+            # Beim Freigeben wird der Staffelblock deshalb nach SxxExx sortiert
+            # und geschlossen ans Ende der aktuellen Queue gesetzt.
+            jobs = con.execute(
+                """
+                SELECT id FROM download_jobs
+                WHERE batch_id=%s AND status='queued'
+                ORDER BY payload->>'manual_title',id
+                FOR UPDATE
+                """,
+                (batch_id,),
+            ).fetchall()
+            end_position = int(con.execute(
+                "SELECT COALESCE(max(queue_position),0) AS position FROM download_jobs"
+            ).fetchone()['position'])
+            for index, job in enumerate(jobs, 1):
+                con.execute(
+                    "UPDATE download_jobs SET queue_position=%s WHERE id=%s",
+                    (end_position + index * 1000, job['id']),
+                )
             con.execute(
                 "UPDATE download_batches SET status='ready',released_at=now(),updated_at=now() WHERE id=%s AND status='collecting'",
                 (batch_id,),
@@ -285,6 +364,7 @@ class CentralQueue:
                             THEN (payload->>'priority')::integer
                             ELSE 0
                         END DESC,
+                        COALESCE(queue_position,id),
                         available_at,
                         id
                     FOR UPDATE SKIP LOCKED
@@ -360,13 +440,123 @@ class CentralQueue:
                 (error[:1000], job_id, worker_id),
             )
 
-    def open_jobs(self, limit: int = 50) -> list[dict]:
+    def open_jobs(self, limit: int = 500) -> list[dict]:
         with self.connect() as con:
             rows = con.execute(
-                "SELECT id,status,payload,attempts,available_at,locked_by FROM download_jobs WHERE status IN ('queued','processing') ORDER BY available_at,id LIMIT %s",
+                """
+                SELECT j.id,j.status,j.payload,j.attempts,j.available_at,
+                       j.locked_by,j.batch_id,j.queue_position,b.title AS batch_title
+                FROM download_jobs j
+                LEFT JOIN download_batches b ON b.id=j.batch_id
+                WHERE j.status='processing'
+                   OR (
+                       j.status='queued'
+                       AND (j.batch_id IS NULL OR b.status='ready')
+                   )
+                ORDER BY
+                    CASE WHEN j.status='processing' THEN 0 ELSE 1 END,
+                    CASE
+                        WHEN j.payload->>'priority' ~ '^-?[0-9]+$'
+                        THEN (j.payload->>'priority')::integer
+                        ELSE 0
+                    END DESC,
+                    COALESCE(j.queue_position,j.id),j.id
+                LIMIT %s
+                """,
                 (limit,),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    @staticmethod
+    def _queue_group_key(row: dict) -> tuple:
+        """Staffel-Batches bzw. SxxExx-Titel zu einem verschiebbaren Block bündeln."""
+        if row.get('batch_id') is not None:
+            return ('batch', int(row['batch_id']))
+        payload = row.get('payload') or {}
+        title = payload.get('manual_title') or ''
+        match = re.match(r'^(.*?)\s+S(\d{1,3})E\d{1,4}(?:\b|\s)', title, re.IGNORECASE)
+        if match:
+            return (
+                'season',
+                match.group(1).strip().casefold(),
+                int(match.group(2)),
+                bool(payload.get('is_anime')),
+            )
+        return ('job', int(row['id']))
+
+    def reorder_group(self, anchor_job_id: int, action: str) -> dict | None:
+        """Verschiebt einen kompletten Staffelblock atomar in der Remote Queue."""
+        if action not in ('up', 'down', 'front', 'back'):
+            raise ValueError('Ungültige Queue-Aktion')
+        with self.connect() as con:
+            con.execute("SELECT pg_advisory_xact_lock(hashtext('download_jobs_queue_order'))")
+            rows = con.execute(
+                """
+                SELECT j.id,j.payload,j.batch_id,j.queue_position,b.title AS batch_title
+                FROM download_jobs j
+                LEFT JOIN download_batches b ON b.id=j.batch_id
+                WHERE j.status='queued'
+                  AND (j.batch_id IS NULL OR b.status='ready')
+                ORDER BY
+                    CASE
+                        WHEN j.payload->>'priority' ~ '^-?[0-9]+$'
+                        THEN (j.payload->>'priority')::integer
+                        ELSE 0
+                    END DESC,
+                    COALESCE(j.queue_position,j.id),j.id
+                FOR UPDATE OF j
+                """
+            ).fetchall()
+            rows = [dict(row) for row in rows]
+            anchor = next((row for row in rows if int(row['id']) == int(anchor_job_id)), None)
+            if not anchor:
+                return None
+
+            groups: list[list[dict]] = []
+            group_indexes: dict[tuple, int] = {}
+            for row in rows:
+                key = self._queue_group_key(row)
+                if key not in group_indexes:
+                    group_indexes[key] = len(groups)
+                    groups.append([])
+                groups[group_indexes[key]].append(row)
+
+            anchor_key = self._queue_group_key(anchor)
+            old_index = group_indexes[anchor_key]
+            new_index = old_index
+            if action == 'up':
+                new_index = max(0, old_index - 1)
+            elif action == 'down':
+                new_index = min(len(groups) - 1, old_index + 1)
+            elif action == 'front':
+                new_index = 0
+            elif action == 'back':
+                new_index = len(groups) - 1
+
+            moved = groups.pop(old_index)
+            groups.insert(new_index, moved)
+            position = 0
+            for group in groups:
+                for row in group:
+                    position += 1000
+                    # Nach einer manuellen Sortierung ist die sichtbare Position
+                    # maßgeblich; alte Prioritätswerte dürfen sie nicht überstimmen.
+                    con.execute(
+                        """
+                        UPDATE download_jobs
+                        SET queue_position=%s,
+                            payload=(payload - 'priority') || '{"priority": 0}'::jsonb,
+                            updated_at=now()
+                        WHERE id=%s
+                        """,
+                        (position, row['id']),
+                    )
+            return {
+                'from': old_index + 1,
+                'to': new_index + 1,
+                'groups': len(groups),
+                'jobs': len(moved),
+            }
 
     def clear_waiting_jobs(self) -> dict[str, int]:
         """Leert alle offenen Jobs und Batch-Entwürfe der zentralen Queue."""
