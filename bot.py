@@ -5408,7 +5408,30 @@ async def cmd_remote_queue_positions(update: Update, context: ContextTypes.DEFAU
 
 async def handle_remote_queue_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except TgBadRequest as error:
+        error_text = str(error).lower()
+        if (
+            'query is too old' not in error_text
+            and 'query id is invalid' not in error_text
+            and 'response timeout expired' not in error_text
+        ):
+            raise
+        # Nach Bot-Neustarts können noch alte Inline-Buttons im Chat liegen.
+        # Ihre Position ist nicht mehr verlässlich: niemals die alte Aktion
+        # ausführen, sondern nur eine frische Queue-Ansicht anzeigen.
+        logging.info("Abgelaufenen Remote-Queue-Callback ignoriert: %s", error)
+        text, markup = await _remote_queue_view(0)
+        try:
+            await query.edit_message_text(text, reply_markup=markup)
+        except TgBadRequest as edit_error:
+            if "Message is not modified" not in str(edit_error):
+                logging.info(
+                    "Abgelaufene Queue-Nachricht konnte nicht aktualisiert werden: %s",
+                    edit_error,
+                )
+        return
     page = 0
     if query.data.startswith('rqpage:'):
         page = int(query.data.split(':', 1)[1])
