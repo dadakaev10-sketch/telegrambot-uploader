@@ -563,6 +563,58 @@ def _is_direct_player_url(url: str) -> bool:
         return False
 
 
+def _unpack_numeric_javascript(source: str) -> str | None:
+    """Dekodiert die von Miixdrop verwendete einfache Dean-Edwards-Packerform."""
+    match = re.search(
+        r"eval\(function\(p,a,c,k,e,d\).*?\}\("
+        r"(?P<quote>['\"])(?P<payload>.*?)(?P=quote),\s*10,\s*\d+,\s*"
+        r"(?P<kquote>['\"])(?P<keys>.*?)(?P=kquote)\.split\('\|'\)",
+        source,
+        re.DOTALL,
+    )
+    if not match:
+        return None
+    payload = match.group('payload')
+    keys = match.group('keys').split('|')
+    return re.sub(
+        r'\b\d+\b',
+        lambda token: (
+            keys[int(token.group(0))]
+            if int(token.group(0)) < len(keys) and keys[int(token.group(0))]
+            else token.group(0)
+        ),
+        payload,
+    )
+
+
+def _resolve_miixdrop_player(page_url: str) -> tuple[str, str | None, str]:
+    """Extrahiert Miixdrops signierte MP4-URL statisch, ohne reCAPTCHA-Klick."""
+    response = requests.get(
+        page_url,
+        headers={'User-Agent': USER_AGENT, 'Referer': 'https://miixdrop.com/'},
+        timeout=30,
+    )
+    response.raise_for_status()
+    unpacked = _unpack_numeric_javascript(response.text)
+    if not unpacked:
+        raise RuntimeError('Miixdrop: gepackte Playerdaten nicht gefunden')
+    media_match = re.search(r'MDCore\.wurl\s*=\s*["\']([^"\']+)', unpacked)
+    if not media_match:
+        media_match = re.search(r'MDCore\.furl\s*=\s*["\']([^"\']+)', unpacked)
+    if not media_match:
+        raise RuntimeError('Miixdrop: keine Mediendatei in Playerdaten gefunden')
+    media_url = media_match.group(1).replace('\\/', '/')
+    if media_url.startswith('//'):
+        media_url = 'https:' + media_url
+    if not media_url.startswith(('http://', 'https://')):
+        raise RuntimeError('Miixdrop: ungültige Medien-URL')
+    soup = BeautifulSoup(response.text, 'html.parser')
+    title_el = soup.select_one('.title a') or soup.select_one('title')
+    title = title_el.get_text(' ', strip=True) if title_el else None
+    cookies = '; '.join(f'{key}={value}' for key, value in response.cookies.items())
+    return media_url, title, cookies
+
+
 @asynccontextmanager
 async def _open_browser(*, camoufox: bool, headless: bool = True):
     """Öffnet Camoufox nur für SerienStream, sonst Playwright Chromium."""
@@ -596,6 +648,16 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
     referer = None
     cookie_str = ""
     source_voe_url = None  # zum DB-Vergleich (erkennt Re-Uploads in besserer Qualität)
+
+    if 'miixdrop.com/' in page_url.lower():
+        logging.info("Miixdrop: dekodiere statische Playerdaten ohne Browser")
+        media_url, miixdrop_title, cookie_str = await asyncio.to_thread(
+            _resolve_miixdrop_player, page_url
+        )
+        if source_only:
+            return None, miixdrop_title, page_url, cookie_str, page_url
+        logging.info("Miixdrop: direkte MP4-URL extrahiert: %s", media_url[:120])
+        return media_url, miixdrop_title, page_url, cookie_str, page_url
 
     is_direct_manual_player = (
         content_type == 'film' and _is_direct_player_url(page_url)
@@ -1807,6 +1869,44 @@ def get_video_metadata(filepath: str) -> dict:
     except Exception as e:
         logging.warning(f"ffprobe Fehler: {e}")
         return {'width': 1280, 'height': 720, 'duration': 0}
+
+
+def _existing_download_is_complete(
+    filepath: str,
+    source_url: str | None = None,
+    direct_media_url: bool = False,
+) -> tuple[bool, str]:
+    """Verhindert, dass abgebrochene Downloads als fertige Videos hochgehen."""
+    if not os.path.exists(filepath):
+        return False, 'Datei fehlt'
+    local_size = os.path.getsize(filepath)
+    if local_size <= 10 * 1024 * 1024:
+        return False, 'Datei ist zu klein'
+
+    if direct_media_url:
+        try:
+            response = requests.head(
+                source_url,
+                headers={'User-Agent': USER_AGENT},
+                allow_redirects=True,
+                timeout=20,
+            )
+            response.raise_for_status()
+            expected_size = int(response.headers.get('Content-Length') or 0)
+        except Exception as error:
+            return False, f'Direktdatei-Größe nicht prüfbar: {error}'
+        if expected_size <= 0:
+            return False, 'Direktdatei liefert keine Content-Length'
+        if local_size < int(expected_size * 0.995):
+            return False, (
+                f'unvollständig: {local_size / 1024**2:.1f} von '
+                f'{expected_size / 1024**2:.1f} MB'
+            )
+
+    metadata = get_video_metadata(filepath)
+    if int(metadata.get('duration') or 0) <= 0:
+        return False, 'ffprobe erkennt keine vollständige Videodauer'
+    return True, 'Größe und Videostruktur gültig'
 
 
 SIZE_LIMIT_MB = 2048  # Telegram-Limit: 2 GB
@@ -3872,8 +3972,21 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
 
         filepath = os.path.join(DOWNLOAD_DIR, f"{filename}.mp4")
 
-        # Datei schon vorhanden? (z.B. Upload nach Neustart abgebrochen)
-        file_ready = os.path.exists(filepath) and os.path.getsize(filepath) > 10 * 1024 * 1024
+        # Datei schon vorhanden? Größe und Videostruktur prüfen; insbesondere
+        # direkte MP4-Downloads können bei einem Abbruch als große, aber nur
+        # teilweise geschriebene Datei liegen bleiben.
+        file_ready, existing_file_reason = _existing_download_is_complete(
+            filepath,
+            url,
+            direct_media_url,
+        )
+        if os.path.exists(filepath) and not file_ready:
+            logging.warning(
+                "Unvollständige Download-Datei wird verworfen: %s (%s)",
+                filepath,
+                existing_file_reason,
+            )
+            os.remove(filepath)
 
         if file_ready:
             size_mb = os.path.getsize(filepath) / (1024 * 1024)
