@@ -1673,8 +1673,11 @@ async def download_with_browser(stream_url: str, filepath: str, referer: str | N
             ts_mb = os.path.getsize(ts_path) / (1024 * 1024)
             logging.info(f"Browser-Download fertig: {ts_mb:.0f} MB in {dl_time:.0f}s")
 
-            cmd = ['ffmpeg', '-i', ts_path, '-c', 'copy', '-bsf:a', 'aac_adtstoasc',
-                   '-loglevel', 'error', filepath, '-y']
+            cmd = [
+                'ffmpeg', '-analyzeduration', '100M', '-probesize', '100M',
+                '-i', ts_path, '-c', 'copy', '-bsf:a', 'aac_adtstoasc',
+                '-loglevel', 'error', filepath, '-y',
+            ]
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.DEVNULL,
@@ -1682,6 +1685,35 @@ async def download_with_browser(stream_url: str, filepath: str, referer: str | N
                 creationflags=_NO_WINDOW,
             )
             _, stderr = await proc.communicate()
+
+            # Manche VOE-TS-Streams melden für AAC keine Sample-Rate. Ein
+            # reines Stream-Copy kann dann keinen MP4-Header schreiben. Video
+            # bleibt unverändert; nur Audio wird mit expliziten Parametern neu
+            # kodiert.
+            if proc.returncode != 0 and b'sample rate not set' in stderr.lower():
+                logging.warning(
+                    "ffmpeg-mux: Audio-Sample-Rate fehlt – neuer Versuch mit AAC 48 kHz"
+                )
+                try:
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                except OSError:
+                    pass
+                retry_cmd = [
+                    'ffmpeg', '-analyzeduration', '100M', '-probesize', '100M',
+                    '-i', ts_path,
+                    '-map', '0:v:0?', '-map', '0:a:0?',
+                    '-c:v', 'copy', '-c:a', 'aac', '-ar', '48000', '-ac', '2',
+                    '-b:a', '192k', '-movflags', '+faststart',
+                    '-loglevel', 'error', filepath, '-y',
+                ]
+                proc = await asyncio.create_subprocess_exec(
+                    *retry_cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                    creationflags=_NO_WINDOW,
+                )
+                _, stderr = await proc.communicate()
             try:
                 os.remove(ts_path)
             except Exception:
@@ -1733,7 +1765,6 @@ async def download_with_ytdlp(stream_url: str, filepath: str, referer: str | Non
         '-o', out_template + '.%(ext)s',
         '--merge-output-format', 'mp4',
         '--user-agent', USER_AGENT,
-        '--impersonate', 'chrome',  # TLS-Fingerprint von Chrome (umgeht JA3/JA4 CDN-Blocking)
     ]
     if preferred_height:
         cmd += ['-f', f'bestvideo[height<={preferred_height}]+bestaudio/best[height<={preferred_height}]']
@@ -1815,8 +1846,13 @@ async def download_with_ffmpeg(stream_url: str, filepath: str, referer: str | No
             headers += f"Cookie: {cookie_str}\r\n"
         cmd += ['-headers', headers]
         logging.info(f"ffmpeg Referer: {referer}, Cookies: {len(cookie_str)} Zeichen")
-    cmd += ['-i', stream_url, '-c', 'copy', '-bsf:a', 'aac_adtstoasc',
-            '-aspect', '16:9', '-loglevel', 'error', filepath, '-y']
+    input_cmd = cmd + [
+        '-analyzeduration', '100M', '-probesize', '100M', '-i', stream_url,
+    ]
+    cmd = input_cmd + [
+        '-c', 'copy', '-bsf:a', 'aac_adtstoasc',
+        '-aspect', '16:9', '-loglevel', 'error', filepath, '-y',
+    ]
 
     global _active_proc
     proc = await asyncio.create_subprocess_exec(
@@ -1828,6 +1864,31 @@ async def download_with_ffmpeg(stream_url: str, filepath: str, referer: str | No
     _active_proc = proc
     _, stderr = await proc.communicate()
     _active_proc = None
+
+    if proc.returncode != 0 and b'sample rate not set' in stderr.lower():
+        logging.warning(
+            "ffmpeg: Audio-Sample-Rate fehlt – neuer Versuch mit AAC 48 kHz"
+        )
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except OSError:
+            pass
+        retry_cmd = input_cmd + [
+            '-map', '0:v:0?', '-map', '0:a:0?',
+            '-c:v', 'copy', '-c:a', 'aac', '-ar', '48000', '-ac', '2',
+            '-b:a', '192k', '-movflags', '+faststart',
+            '-aspect', '16:9', '-loglevel', 'error', filepath, '-y',
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *retry_cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            creationflags=_NO_WINDOW,
+        )
+        _active_proc = proc
+        _, stderr = await proc.communicate()
+        _active_proc = None
 
     if proc.returncode in (-9, -15):
         logging.info("ffmpeg: abgebrochen")
