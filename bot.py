@@ -2204,13 +2204,36 @@ async def _parallel_upload_file(filepath: str, progress_callback=None):
                    if is_big else
                    SaveFilePartRequest(file_id=file_id, file_part=part_index, bytes=data))
 
-            if senders_usable and senders:
-                # Round-Robin: Part N geht an Sender N % CONNECTIONS
-                sender = senders[part_index % len(senders)]
-                await sender.send(req)
-            else:
-                # Fallback: Alles über den Haupt-Client
-                await tg_client(req)
+            # Telegram kann bei hoher Parallelität einen Part mit False
+            # quittieren, ohne eine Exception zu werfen. Das darf nicht als
+            # erfolgreich gelten, sonst scheitert SendMedia erst ganz am Ende
+            # mit FILE_PARTS_INVALID.
+            result = False
+            last_error = None
+            for attempt in range(1, 4):
+                try:
+                    if senders_usable and senders:
+                        # Round-Robin: Part N geht an Sender N % CONNECTIONS
+                        sender = senders[part_index % len(senders)]
+                        result = await sender.send(req)
+                    else:
+                        # Fallback: Alles über den Haupt-Client
+                        result = await tg_client(req)
+                    if result:
+                        break
+                    last_error = RuntimeError("Telegram bestätigte den Part nicht")
+                except Exception as error:
+                    last_error = error
+                logging.warning(
+                    "Upload-Part %s/%s nicht bestätigt (Versuch %s/3): %s",
+                    part_index + 1, part_count, attempt, last_error,
+                )
+                await asyncio.sleep(attempt)
+            if not result:
+                raise RuntimeError(
+                    f"Upload-Part {part_index + 1}/{part_count} nach 3 Versuchen fehlgeschlagen: "
+                    f"{last_error}"
+                )
 
             # Kein Lock nötig: uploaded_bytes[0] += len(data) ist in CPython atomar,
             # solange es von async Code im selben Event-Loop aufgerufen wird (GIL schützt den Increment).
@@ -2294,8 +2317,25 @@ async def upload_with_telethon(filepath: str, caption: str, progress_msg, progre
                 break
 
     try:
-        # Phase 1: Datei parallel hochladen
-        file_handle = await _parallel_upload_file(filepath, progress_callback)
+        # Phase 1: Datei hochladen. Sehr große Dateien mit mehr als 3000
+        # Telegram-Parts nutzen bewusst Telethons sequenziellen Standardweg.
+        # Der parallele Sender-Pool ist für kleinere Dateien schnell, zeigte
+        # oberhalb dieser Grenze aber vereinzelt FILE_PARTS_INVALID.
+        file_size = os.path.getsize(filepath)
+        telegram_parts = (file_size + (512 * 1024) - 1) // (512 * 1024)
+        if telegram_parts > 3000:
+            logging.info(
+                "Große Datei: zuverlässiger Telethon-Upload (%s Parts)",
+                telegram_parts,
+            )
+            file_handle = await tg_client.upload_file(
+                filepath,
+                part_size_kb=512,
+                file_size=file_size,
+                progress_callback=progress_callback,
+            )
+        else:
+            file_handle = await _parallel_upload_file(filepath, progress_callback)
 
         # Phase 2: Thumbnail explizit hochladen und Media direkt senden.
         # Bei unserem manuellen Parallel-Upload ist die Videodatei schon ein
