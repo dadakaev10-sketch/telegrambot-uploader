@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import os, re, logging, subprocess, requests, asyncio, platform, json, sqlite3, sys, traceback, ast, socket, time as _time
+import os, re, logging, subprocess, requests, asyncio, platform, json, sqlite3, sys, traceback, ast, socket, unicodedata, time as _time
 from contextlib import asynccontextmanager
 
 # Windows cp1252 kann keine Emojis → UTF-8 erzwingen
@@ -17,6 +17,14 @@ def normalize_title(title: str) -> str:
     """Normalisiert Titel: entfernt ':', '-', mehrere Spaces → 1 Space.
     Damit matchen 'Avatar - Fire and Ash', 'Avatar: Fire and Ash' etc."""
     return re.sub(r'[\s:\-]+', ' ', title).strip().lower()
+
+
+def _normalize_series_identity(title: str) -> str:
+    """Robuster Serienabgleich unabhängig von Strichen und Satzzeichen."""
+    value = unicodedata.normalize('NFKC', title or '').casefold()
+    value = value.replace('&', ' und ')
+    value = re.sub(r'[^\w]+', ' ', value, flags=re.UNICODE)
+    return ' '.join(value.split())
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ReplyKeyboardMarkup
 from telegram.error import BadRequest as TgBadRequest, RetryAfter as TgRetryAfter
 from telegram.ext import (
@@ -3065,6 +3073,146 @@ def _aniworld_watch_base(url: str) -> str:
     return re.sub(r'/staffel-\d+(?:/.*)?$', '', normalized)
 
 
+def _full_episode_catalog(is_anime: bool = False) -> dict[str, dict]:
+    """Liest alle vorhandenen Serien samt Episoden aus der aktiven Medien-DB."""
+    table, column = (
+        ('anime_episodes', 'anime') if is_anime else ('episodes', 'series')
+    )
+    rows = []
+    try:
+        if _central_media_db:
+            with _central_media_db.connect() as con:
+                rows = con.execute(
+                    f"SELECT {column}, season, episode FROM {table}"
+                ).fetchall()
+        else:
+            with sqlite3.connect(DB_PATH) as con:
+                rows = con.execute(
+                    f"SELECT {column}, season, episode FROM {table}"
+                ).fetchall()
+    except Exception:
+        logging.warning(
+            "Vollständiger %s-Katalog nicht lesbar:\n%s",
+            'Anime' if is_anime else 'Serien',
+            traceback.format_exc(),
+        )
+        return {}
+
+    catalog: dict[str, dict] = {}
+    for name, season, episode in rows:
+        key = _normalize_series_identity(str(name or ''))
+        if not key:
+            continue
+        entry = catalog.setdefault(key, {
+            'name': str(name),
+            'episodes': set(),
+        })
+        entry['episodes'].add((int(season), int(episode)))
+    return catalog
+
+
+def _open_episode_job_keys() -> set[tuple[str, int, int, bool]]:
+    """Liest offene Episoden aus lokaler und zentraler Queue zur Deduplizierung."""
+    keys: set[tuple[str, int, int, bool]] = set()
+
+    def _add(title: str, is_anime: bool) -> None:
+        match = re.search(r'^(.*?)\s+S(\d{2})E(\d{2})', title or '', re.I)
+        if match:
+            keys.add((
+                _normalize_series_identity(match.group(1)),
+                int(match.group(2)),
+                int(match.group(3)),
+                bool(is_anime),
+            ))
+
+    candidates = list(_dl_pending)
+    if _dl_active:
+        candidates.append(_dl_active)
+    for item in candidates:
+        persist = item.get('persist', {})
+        _add(
+            persist.get('manual_title') or '',
+            bool(persist.get('is_anime', False)),
+        )
+
+    if _central_queue:
+        try:
+            with _central_queue.connect() as con:
+                rows = con.execute(
+                    """
+                    SELECT payload->>'manual_title' AS title,
+                           COALESCE((payload->>'is_anime')::boolean, false) AS is_anime
+                    FROM download_jobs
+                    WHERE status IN ('queued','processing')
+                    """
+                ).fetchall()
+            for row in rows:
+                _add(row['title'] or '', bool(row['is_anime']))
+        except Exception:
+            logging.warning(
+                "Offene zentrale Episoden-Jobs nicht lesbar:\n%s",
+                traceback.format_exc(),
+            )
+    return keys
+
+
+async def _enqueue_global_latest_from_catalog(
+    app,
+    chat_id: int,
+    latest: dict[str, list[dict]],
+    *,
+    is_anime: bool,
+) -> tuple[int, int]:
+    """Stellt neue deutsche Folgen bereits bekannter DB-Serien in die Queue."""
+    catalog = await asyncio.to_thread(_full_episode_catalog, is_anime)
+    if not catalog:
+        return 0, 0
+    open_keys = await asyncio.to_thread(_open_episode_job_keys)
+    matched_series: set[str] = set()
+    candidates: list[dict] = []
+
+    for episodes in latest.values():
+        if not episodes:
+            continue
+        latest_title = episodes[0].get('title') or ''
+        identity = _normalize_series_identity(latest_title)
+        db_entry = catalog.get(identity)
+        if not db_entry:
+            continue
+        matched_series.add(identity)
+        canonical_name = db_entry['name']
+        existing = db_entry['episodes']
+        for episode in episodes:
+            season = int(episode['season'])
+            number = int(episode['episode'])
+            job_key = (identity, season, number, bool(is_anime))
+            if (season, number) in existing or job_key in open_keys:
+                continue
+            candidates.append({
+                **episode,
+                'title': f"{canonical_name} S{season:02d}E{number:02d}",
+                'content_type': 'anime' if is_anime else 'serie',
+            })
+            open_keys.add(job_key)
+
+    # Stabile, nachvollziehbare Reihenfolge über Serien, Staffel und Folge.
+    candidates.sort(key=lambda item: (
+        _normalize_series_identity(item['title']),
+        int(item['season']),
+        int(item['episode']),
+    ))
+    queued = 0
+    for episode in candidates:
+        queued += await _enqueue_series_episode_batch(
+            app,
+            chat_id,
+            re.sub(r'\s+S\d{2}E\d{2}$', '', episode['title'], flags=re.I),
+            [episode],
+            is_anime,
+        )
+    return len(matched_series), queued
+
+
 def _watch_season_url(series_url: str, season: int) -> str:
     """Erzeugt eine Staffel-URL, sofern die Quelle Staffelpfade unterstützt."""
     if _is_seriesstream_url(series_url) or 'aniworld.to' in series_url:
@@ -5786,7 +5934,7 @@ async def _watchlist_check_once(app, notify_empty: bool = False, manual_chat_id:
         return checked_items, added_jobs
 
     seriesstream_latest: dict[str, list[dict]] | None = None
-    if any(
+    if manual_chat_id or any(
         item.get('enabled', True)
         and item.get('type') == 'series'
         and not bool(item.get('is_anime', False))
@@ -5807,7 +5955,7 @@ async def _watchlist_check_once(app, notify_empty: bool = False, manual_chat_id:
             )
 
     aniworld_latest: dict[str, list[dict]] | None = None
-    if any(
+    if manual_chat_id or any(
         item.get('enabled', True)
         and item.get('type') == 'series'
         and bool(item.get('is_anime', False))
@@ -5824,6 +5972,38 @@ async def _watchlist_check_once(app, notify_empty: bool = False, manual_chat_id:
                 "verwende Staffel-Fallback:\n%s",
                 traceback.format_exc(),
             )
+
+    # Der manuelle Button prüft zusätzlich die globalen deutschen Neuigkeiten
+    # gegen die vollständige Medien-Datenbank. Eine Serie gilt als bekannt,
+    # sobald mindestens eine Episode davon in PostgreSQL/media.db existiert.
+    if manual_chat_id and seriesstream_latest is not None:
+        matched, queued = await _enqueue_global_latest_from_catalog(
+            app,
+            manual_chat_id,
+            seriesstream_latest,
+            is_anime=False,
+        )
+        checked_items += matched
+        added_jobs += queued
+        logging.info(
+            "Globaler SerienStream-DB-Abgleich: %s bekannte Serien, %s neue Folgen",
+            matched,
+            queued,
+        )
+    if manual_chat_id and aniworld_latest is not None:
+        matched, queued = await _enqueue_global_latest_from_catalog(
+            app,
+            manual_chat_id,
+            aniworld_latest,
+            is_anime=True,
+        )
+        checked_items += matched
+        added_jobs += queued
+        logging.info(
+            "Globaler AniWorld-DB-Abgleich: %s bekannte Anime, %s neue Folgen",
+            matched,
+            queued,
+        )
 
     for entry in list(_watchlist):
         if not entry.get('enabled', True):
@@ -5974,6 +6154,9 @@ async def _watchlist_check_once(app, notify_empty: bool = False, manual_chat_id:
                         continue
 
                     new_numbers = set(current_numbers) - previous_numbers
+                    open_episode_keys = await asyncio.to_thread(
+                        _open_episode_job_keys
+                    )
                     candidates = [
                         ep for ep in episodes
                         if (
@@ -5986,6 +6169,12 @@ async def _watchlist_check_once(app, notify_empty: bool = False, manual_chat_id:
                             or (season, int(ep.get('episode', 0))) in known_german_episode_keys
                         )
                         and not ep.get('skip', False)
+                        and (
+                            _normalize_series_identity(series_title),
+                            int(season),
+                            int(ep.get('episode', 0)),
+                            bool(is_anime),
+                        ) not in open_episode_keys
                     ]
                     if candidates:
                         queued_total += await _enqueue_series_episode_batch(
@@ -6044,11 +6233,9 @@ async def _watchlist_check_once(app, notify_empty: bool = False, manual_chat_id:
 
 
 async def cmd_watchcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _watchlist:
-        await update.message.reply_text("ℹ️ Watchlist ist leer.")
-        return
-
-    await update.message.reply_text("🔍 Prüfe Watchlist auf neue Folgen/Filme...")
+    await update.message.reply_text(
+        "🔍 Prüfe deutsche Neuerscheinungen gegen Medien-Datenbank und Watchlist..."
+    )
     await _watchlist_check_once(
         context.application,
         notify_empty=True,
