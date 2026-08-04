@@ -558,6 +558,60 @@ class CentralQueue:
                 'jobs': len(moved),
             }
 
+    def cancel_group(self, anchor_job_id: int, reason: str = 'Vom Benutzer abgebrochen') -> dict | None:
+        """Bricht den sichtbaren Queue-Block des Anker-Jobs atomar ab."""
+        with self.connect() as con:
+            con.execute("SELECT pg_advisory_xact_lock(hashtext('download_jobs_queue_order'))")
+            rows = con.execute(
+                """
+                SELECT j.id,j.payload,j.batch_id,j.queue_position
+                FROM download_jobs j
+                LEFT JOIN download_batches b ON b.id=j.batch_id
+                WHERE j.status='queued'
+                  AND (j.batch_id IS NULL OR b.status='ready')
+                ORDER BY COALESCE(j.queue_position,j.id),j.id
+                FOR UPDATE OF j
+                """
+            ).fetchall()
+            rows = [dict(row) for row in rows]
+            anchor = next(
+                (row for row in rows if int(row['id']) == int(anchor_job_id)),
+                None,
+            )
+            if not anchor:
+                return None
+            key = self._queue_group_key(anchor)
+            selected = [row for row in rows if self._queue_group_key(row) == key]
+            ids = [int(row['id']) for row in selected]
+            con.execute(
+                """
+                UPDATE download_jobs
+                SET status='cancelled',last_error=%s,updated_at=now(),
+                    locked_by=NULL,locked_at=NULL
+                WHERE id=ANY(%s) AND status='queued'
+                """,
+                (reason[:1000], ids),
+            )
+            batch_ids = sorted({
+                int(row['batch_id']) for row in selected
+                if row.get('batch_id') is not None
+            })
+            for batch_id in batch_ids:
+                con.execute(
+                    """
+                    UPDATE download_batches b
+                    SET status='cancelled',updated_at=now()
+                    WHERE b.id=%s
+                      AND NOT EXISTS (
+                          SELECT 1 FROM download_jobs j
+                          WHERE j.batch_id=b.id
+                            AND j.status IN ('queued','processing')
+                      )
+                    """,
+                    (batch_id,),
+                )
+            return {'jobs': selected, 'count': len(selected)}
+
     def clear_waiting_jobs(self) -> dict[str, int]:
         """Leert alle offenen Jobs und Batch-Entwürfe der zentralen Queue."""
         with self.connect() as con:

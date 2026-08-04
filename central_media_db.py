@@ -73,8 +73,9 @@ class CentralMediaDB:
     def _normalize_name(value: str) -> str:
         value = unicodedata.normalize('NFKC', value or '').casefold()
         value = value.replace('&', ' und ')
-        value = re.sub(r'[^\w]+', ' ', value, flags=re.UNICODE)
-        return ' '.join(value.split())
+        # Für Identitäten Satzzeichen und Abstände vollständig ignorieren:
+        # S.W.A.T., S-W-A-T und SWAT müssen dieselbe Serie bezeichnen.
+        return ''.join(re.findall(r'\w+', value, flags=re.UNICODE))
 
     def exists(self, content_type: str, filename: str, is_anime: bool = False) -> bool:
         with self.connect() as con:
@@ -94,11 +95,12 @@ class CentralMediaDB:
                 return False
             name, season, episode = parts
             table, column = ('anime_episodes', 'anime') if is_anime else ('episodes', 'series')
-            row = con.execute(
-                f"SELECT 1 FROM {table} WHERE lower({column})=lower(%s) AND season=%s AND episode=%s",
-                (name, season, episode),
-            ).fetchone()
-            return row is not None
+            rows = con.execute(
+                f"SELECT {column} FROM {table} WHERE season=%s AND episode=%s",
+                (season, episode),
+            ).fetchall()
+            normalized = self._normalize_name(name)
+            return any(self._normalize_name(row[0]) == normalized for row in rows)
 
     def exists_batch(self, content_type: str, filenames: list[str], is_anime: bool = False) -> dict[str, bool]:
         result = {filename: False for filename in filenames}
@@ -126,10 +128,14 @@ class CentralMediaDB:
                     if not parts:
                         continue
                     name, season, episode = parts
-                    result[filename] = con.execute(
-                        f"SELECT 1 FROM {table} WHERE lower({column})=lower(%s) AND season=%s AND episode=%s",
-                        (name, season, episode),
-                    ).fetchone() is not None
+                    rows = con.execute(
+                        f"SELECT {column} FROM {table} WHERE season=%s AND episode=%s",
+                        (season, episode),
+                    ).fetchall()
+                    normalized = self._normalize_name(name)
+                    result[filename] = any(
+                        self._normalize_name(row[0]) == normalized for row in rows
+                    )
         return result
 
     def add(self, content_type: str, filename: str, is_anime: bool = False,
@@ -168,13 +174,22 @@ class CentralMediaDB:
                 return
             name, season, episode = parts
             table, column = ('anime_episodes', 'anime') if is_anime else ('episodes', 'series')
-            if overwrite:
-                updated = con.execute(
-                    f"UPDATE {table} SET voe_url=%s, updated_at=now() WHERE lower({column})=lower(%s) AND season=%s AND episode=%s",
-                    (voe_url, name, season, episode),
-                ).rowcount
-                if updated:
-                    return
+            rows = con.execute(
+                f"SELECT {column} FROM {table} WHERE season=%s AND episode=%s",
+                (season, episode),
+            ).fetchall()
+            normalized = self._normalize_name(name)
+            matched_name = next(
+                (row[0] for row in rows if self._normalize_name(row[0]) == normalized),
+                None,
+            )
+            if matched_name is not None:
+                if overwrite:
+                    con.execute(
+                        f"UPDATE {table} SET voe_url=%s, updated_at=now() WHERE {column}=%s AND season=%s AND episode=%s",
+                        (voe_url, matched_name, season, episode),
+                    )
+                return
             con.execute(
                 f"INSERT INTO {table}({column},season,episode,voe_url) VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING",
                 (name, season, episode, voe_url),
@@ -201,13 +216,19 @@ class CentralMediaDB:
                 if not parts:
                     return None
                 table, column = ('anime_episodes', 'anime') if is_anime else ('episodes', 'series')
-                row = con.execute(
-                    f"SELECT voe_url FROM {table} WHERE lower({column})=lower(%s) AND season=%s AND episode=%s",
-                    parts,
-                ).fetchone()
+                name, season, episode = parts
+                rows = con.execute(
+                    f"SELECT {column},voe_url FROM {table} WHERE season=%s AND episode=%s",
+                    (season, episode),
+                ).fetchall()
+                normalized = self._normalize_name(name)
+                row = next(
+                    (item for item in rows if self._normalize_name(item[0]) == normalized),
+                    None,
+                )
             if not row:
                 return None
-            return row[1] if content_type == 'film' else row[0]
+            return row[1]
 
     def import_rows(self, movies: Iterable[tuple], episodes: Iterable[tuple], anime: Iterable[tuple]) -> dict[str, int]:
         movies = list(movies)

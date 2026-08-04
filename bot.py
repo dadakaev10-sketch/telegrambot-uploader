@@ -5964,6 +5964,16 @@ async def _remote_queue_view(page: int = 0) -> tuple[str, InlineKeyboardMarkup |
             InlineKeyboardButton("⬇️", callback_data=f"rqmv:down:{anchor}:{page}"),
             InlineKeyboardButton("⏬", callback_data=f"rqmv:back:{anchor}:{page}"),
         ])
+        keyboard.append([
+            InlineKeyboardButton(
+                f"🗑 {offset} löschen",
+                callback_data=f"rqask:cancel:{anchor}:{page}",
+            ),
+            InlineKeyboardButton(
+                f"✅ {offset} vorhanden",
+                callback_data=f"rqask:done:{anchor}:{page}",
+            ),
+        ])
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("◀️ Zurück", callback_data=f"rqpage:{page - 1}"))
@@ -6010,6 +6020,59 @@ async def handle_remote_queue_positions(update: Update, context: ContextTypes.DE
     page = 0
     if query.data.startswith('rqpage:'):
         page = int(query.data.split(':', 1)[1])
+    elif query.data.startswith('rqask:'):
+        _prefix, action, anchor_text, page_text = query.data.split(':', 3)
+        page = int(page_text)
+        verb = "löschen/abbrechen" if action == 'cancel' else "als bereits vorhanden markieren"
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "Ja, bestätigen",
+                callback_data=f"rqdo:{action}:{anchor_text}:{page}",
+            ),
+            InlineKeyboardButton(
+                "Nein",
+                callback_data=f"rqpage:{page}",
+            ),
+        ]])
+        await query.edit_message_text(
+            f"Wirklich den ausgewählten Queue-Eintrag samt Staffelgruppe {verb}?",
+            reply_markup=markup,
+        )
+        return
+    elif query.data.startswith('rqdo:'):
+        _prefix, action, anchor_text, page_text = query.data.split(':', 3)
+        page = int(page_text)
+        reason = (
+            'Vom Benutzer als bereits vorhanden markiert'
+            if action == 'done' else 'Vom Benutzer über Remote Queue abgebrochen'
+        )
+        result = await asyncio.to_thread(
+            _central_queue.cancel_group,
+            int(anchor_text),
+            reason,
+        )
+        marked = 0
+        if result and action == 'done':
+            for job in result['jobs']:
+                payload = job.get('payload') or {}
+                title = payload.get('manual_title')
+                content_type = payload.get('content_type')
+                if not title or content_type not in ('film', 'serie', 'anime'):
+                    continue
+                await asyncio.to_thread(
+                    _db_add,
+                    content_type,
+                    title,
+                    bool(payload.get('is_anime')),
+                    False,
+                    payload.get('url'),
+                )
+                marked += 1
+        if result:
+            logging.info(
+                "Remote-Queue-Gruppe #%s: %s (%s Jobs, %s markiert)",
+                anchor_text, action, result['count'], marked,
+            )
     else:
         _prefix, action, anchor_text, page_text = query.data.split(':', 3)
         page = int(page_text)
@@ -6552,6 +6615,7 @@ async def cmd_hdfilme_latest(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         film_found = film_existing = film_queued = film_upgrades = 0
         series_found = series_complete = series_queued = 0
+        known_series = await asyncio.to_thread(_full_episode_catalog, False)
 
         for item in items:
             if item['type'] == 'film':
@@ -6576,6 +6640,15 @@ async def cmd_hdfilme_latest(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 continue
 
             series_found += 1
+            series_identity = _normalize_series_identity(item.get('title') or '')
+            if series_identity in known_series:
+                series_complete += 1
+                logging.info(
+                    "HDFilme Latest: bekannte Serie '%s' wird nicht erneut "
+                    "über eine alternative Quelle importiert",
+                    item.get('title'),
+                )
+                continue
             if _watchlist_job_exists('series', item['url'], False):
                 series_queued += 1
                 continue
@@ -7526,7 +7599,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(handle_reupload, pattern="^reupload_"))
     app.add_handler(CallbackQueryHandler(handle_cancel_queue, pattern="^cancel_queue_"))
     app.add_handler(CallbackQueryHandler(handle_clear_remote_queue, pattern="^clear_remote_queue_"))
-    app.add_handler(CallbackQueryHandler(handle_remote_queue_positions, pattern="^rq(?:mv|page):"))
+    app.add_handler(CallbackQueryHandler(handle_remote_queue_positions, pattern="^rq(?:mv|page|ask|do):"))
     app.add_handler(CallbackQueryHandler(handle_central_type, pattern="^central_type_"))
 
     print("🤖 Bot läuft!")
