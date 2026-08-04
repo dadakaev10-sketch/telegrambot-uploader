@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Iterable
 
 import psycopg
@@ -68,6 +69,13 @@ class CentralMediaDB:
             return None
         return match.group(1).strip(), int(match.group(2))
 
+    @staticmethod
+    def _normalize_name(value: str) -> str:
+        value = unicodedata.normalize('NFKC', value or '').casefold()
+        value = value.replace('&', ' und ')
+        value = re.sub(r'[^\w]+', ' ', value, flags=re.UNICODE)
+        return ' '.join(value.split())
+
     def exists(self, content_type: str, filename: str, is_anime: bool = False) -> bool:
         with self.connect() as con:
             if content_type == 'film':
@@ -75,11 +83,12 @@ class CentralMediaDB:
                 if not parts:
                     return False
                 title, year = parts
-                row = con.execute(
-                    "SELECT 1 FROM movies WHERE lower(title)=lower(%s) AND year BETWEEN %s AND %s LIMIT 1",
-                    (title, year - 1, year + 1),
-                ).fetchone()
-                return row is not None
+                rows = con.execute(
+                    "SELECT title FROM movies WHERE year BETWEEN %s AND %s",
+                    (year - 1, year + 1),
+                ).fetchall()
+                normalized = self._normalize_name(title)
+                return any(self._normalize_name(row[0]) == normalized for row in rows)
             parts = self._episode_parts(filename)
             if not parts:
                 return False
@@ -102,10 +111,14 @@ class CentralMediaDB:
                     if not parts:
                         continue
                     title, year = parts
-                    result[filename] = con.execute(
-                        "SELECT 1 FROM movies WHERE lower(title)=lower(%s) AND year BETWEEN %s AND %s LIMIT 1",
-                        (title, year - 1, year + 1),
-                    ).fetchone() is not None
+                    rows = con.execute(
+                        "SELECT title FROM movies WHERE year BETWEEN %s AND %s",
+                        (year - 1, year + 1),
+                    ).fetchall()
+                    normalized = self._normalize_name(title)
+                    result[filename] = any(
+                        self._normalize_name(row[0]) == normalized for row in rows
+                    )
             else:
                 table, column = ('anime_episodes', 'anime') if is_anime else ('episodes', 'series')
                 parsed = [(filename, self._episode_parts(filename)) for filename in filenames]
@@ -128,10 +141,21 @@ class CentralMediaDB:
                     return
                 title, year = parts
                 if overwrite:
-                    updated = con.execute(
-                        "UPDATE movies SET voe_url=%s, updated_at=now() WHERE lower(title)=lower(%s) AND year=%s",
-                        (voe_url, title, year),
-                    ).rowcount
+                    rows = con.execute(
+                        "SELECT title FROM movies WHERE year=%s",
+                        (year,),
+                    ).fetchall()
+                    normalized = self._normalize_name(title)
+                    matched_title = next(
+                        (row[0] for row in rows if self._normalize_name(row[0]) == normalized),
+                        None,
+                    )
+                    updated = 0
+                    if matched_title is not None:
+                        updated = con.execute(
+                            "UPDATE movies SET voe_url=%s, updated_at=now() WHERE title=%s AND year=%s",
+                            (voe_url, matched_title, year),
+                        ).rowcount
                     if updated:
                         return
                 con.execute(
@@ -162,9 +186,16 @@ class CentralMediaDB:
                 parts = self._movie_parts(filename)
                 if not parts:
                     return None
-                row = con.execute(
-                    "SELECT voe_url FROM movies WHERE lower(title)=lower(%s) AND year=%s LIMIT 1", parts
-                ).fetchone()
+                title, year = parts
+                rows = con.execute(
+                    "SELECT title, voe_url FROM movies WHERE year=%s",
+                    (year,),
+                ).fetchall()
+                normalized = self._normalize_name(title)
+                row = next(
+                    (item for item in rows if self._normalize_name(item[0]) == normalized),
+                    None,
+                )
             else:
                 parts = self._episode_parts(filename)
                 if not parts:
@@ -174,7 +205,9 @@ class CentralMediaDB:
                     f"SELECT voe_url FROM {table} WHERE lower({column})=lower(%s) AND season=%s AND episode=%s",
                     parts,
                 ).fetchone()
-            return row[0] if row else None
+            if not row:
+                return None
+            return row[1] if content_type == 'film' else row[0]
 
     def import_rows(self, movies: Iterable[tuple], episodes: Iterable[tuple], anime: Iterable[tuple]) -> dict[str, int]:
         movies = list(movies)

@@ -263,10 +263,151 @@ def scrape_title(url: str) -> str:
 
 # ─── Lokale Media-DB ──────────────────────────────
 
+_PROVISIONAL_MOVIE_QUALITIES = {'TS/LD', 'CAM/MIC'}
+
+
+def _normalize_movie_quality(label: str | None) -> str:
+    value = re.sub(r'\s+', '', str(label or '')).upper()
+    if value in ('TS/LD', 'CAM/MIC'):
+        return value
+    return str(label or 'HD').strip().upper() or 'HD'
+
+
+def _movie_title_year(filename: str) -> tuple[str, int] | None:
+    match = re.search(r'^(.*?)\s*\((\d{4})\)', filename or '')
+    if not match:
+        return None
+    return match.group(1).strip(), int(match.group(2))
+
+
+def _movie_quality_init() -> None:
+    if _central_media_db:
+        with _central_media_db.connect() as con:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS movie_quality_status (
+                    title TEXT NOT NULL,
+                    title_key TEXT,
+                    year INTEGER NOT NULL,
+                    quality_label TEXT NOT NULL DEFAULT 'HD',
+                    provisional BOOLEAN NOT NULL DEFAULT false,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            con.execute(
+                "ALTER TABLE movie_quality_status ADD COLUMN IF NOT EXISTS title_key TEXT"
+            )
+            con.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS movie_quality_status_key_year_uq
+                ON movie_quality_status (title_key, year)
+                WHERE title_key IS NOT NULL
+            """)
+        return
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS movie_quality_status (
+                title TEXT NOT NULL,
+                title_key TEXT,
+                year INTEGER NOT NULL,
+                quality_label TEXT NOT NULL DEFAULT 'HD',
+                provisional INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (title, year)
+            )
+        """)
+        try:
+            con.execute("ALTER TABLE movie_quality_status ADD COLUMN title_key TEXT")
+        except sqlite3.OperationalError as exc:
+            if 'duplicate column name' not in str(exc).lower():
+                raise
+        con.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS movie_quality_status_key_year_uq
+            ON movie_quality_status (title_key, year)
+            WHERE title_key IS NOT NULL
+        """)
+
+
+def _movie_quality_get(filename: str) -> dict | None:
+    parts = _movie_title_year(filename)
+    if not parts:
+        return None
+    title, year = parts
+    title_key = _normalize_series_identity(title)
+    try:
+        if _central_media_db:
+            with _central_media_db.connect() as con:
+                row = con.execute(
+                    """SELECT quality_label, provisional, updated_at
+                       FROM movie_quality_status
+                       WHERE (title_key=%s OR lower(title)=lower(%s))
+                         AND year=%s LIMIT 1""",
+                    (title_key, title, year),
+                ).fetchone()
+        else:
+            with sqlite3.connect(DB_PATH) as con:
+                row = con.execute(
+                    """SELECT quality_label, provisional, updated_at
+                       FROM movie_quality_status
+                       WHERE (title_key=? OR lower(title)=lower(?))
+                         AND year=? LIMIT 1""",
+                    (title_key, title, year),
+                ).fetchone()
+        if not row:
+            return None
+        return {
+            'quality_label': row[0],
+            'provisional': bool(row[1]),
+            'updated_at': row[2],
+        }
+    except Exception:
+        logging.warning("Film-Qualitätsstatus nicht lesbar:\n%s", traceback.format_exc())
+        return None
+
+
+def _movie_quality_set(filename: str, label: str | None) -> None:
+    parts = _movie_title_year(filename)
+    if not parts:
+        return
+    title, year = parts
+    title_key = _normalize_series_identity(title)
+    quality = _normalize_movie_quality(label)
+    provisional = quality in _PROVISIONAL_MOVIE_QUALITIES
+    if _central_media_db:
+        with _central_media_db.connect() as con:
+            con.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f'movie-quality:{title_key}:{year}',),
+            )
+            updated = con.execute(
+                """UPDATE movie_quality_status
+                   SET quality_label=%s, provisional=%s, updated_at=now()
+                   WHERE (title_key=%s OR lower(title)=lower(%s)) AND year=%s""",
+                (quality, provisional, title_key, title, year),
+            ).rowcount
+            if not updated:
+                con.execute(
+                    """INSERT INTO movie_quality_status
+                       (title,title_key,year,quality_label,provisional)
+                       VALUES (%s,%s,%s,%s,%s)""",
+                    (title, title_key, year, quality, provisional),
+                )
+    else:
+        with sqlite3.connect(DB_PATH) as con:
+            con.execute(
+                """INSERT OR REPLACE INTO movie_quality_status
+                   (title,title_key,year,quality_label,provisional,updated_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (title, title_key, year, quality, int(provisional), _utc_now_iso()),
+            )
+    logging.info(
+        "Film-Qualität gespeichert: %s = %s (vorläufig=%s)",
+        filename, quality, provisional,
+    )
+
 def _db_init():
     """Erstellt media.db und importiert einmalig aus series.db."""
     if _central_media_db:
         _central_media_db.init()
+        _movie_quality_init()
         logging.info("Medien-Datenbank: zentrales PostgreSQL aktiv")
         return
     con = sqlite3.connect(DB_PATH)
@@ -313,6 +454,7 @@ def _db_init():
         except Exception as e:
             logging.warning(f"series.db Import Fehler: {e}")
     con.close()
+    _movie_quality_init()
 
 
 def _db_exists(content_type: str, filename: str, is_anime: bool = False) -> bool:
@@ -3385,6 +3527,8 @@ async def _publish_remote_video(
             'chat_id': persist.get('chat_id'),
             'priority': priority,
         }
+        if persist.get('source_quality_label') is not None:
+            payload['source_quality_label'] = persist.get('source_quality_label')
         job_id, created = await asyncio.to_thread(_central_queue.enqueue, payload)
         position_hint = "ganz vorne" if priority else "ganz hinten"
         await msg.edit_text(
@@ -4075,7 +4219,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def process_video(msg, url: str, content_type: str, manual_title: str | None,
                         is_anime: bool = False, progress_prefix: str = "",
                         auto_skip_existing: bool = False,
-                        direct_media_url: bool = False):
+                        direct_media_url: bool = False,
+                        source_quality_label: str | None = None):
     """Verarbeitung als Background-Task"""
     type_emoji = {"film": "🎬", "serie": "📺", "anime": "🎌", "filmpalast": "🎬"}
 
@@ -4164,7 +4309,33 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
             if exists:
                 stored_voe = _db_get_voe(db_ct, filename, is_anime)
                 logging.info(f"[VOE-CHECK] stored='{stored_voe}' new='{source_voe_url}'")
-                if stored_voe and source_voe_url and stored_voe == source_voe_url:
+                stored_quality = (
+                    _movie_quality_get(filename) if db_ct == 'film' else None
+                )
+                incoming_quality = (
+                    _normalize_movie_quality(source_quality_label)
+                    if source_quality_label is not None else None
+                )
+                forced_quality_upgrade = bool(
+                    db_ct == 'film'
+                    and stored_quality
+                    and stored_quality.get('provisional')
+                    and incoming_quality
+                    and incoming_quality not in _PROVISIONAL_MOVIE_QUALITIES
+                )
+                if forced_quality_upgrade:
+                    update_due_to_new_source = True
+                    logging.info(
+                        "[QUALITY-UPDATE] %s → %s für %s",
+                        stored_quality.get('quality_label'), incoming_quality, filename,
+                    )
+                    await msg.edit_text(
+                        f"♻️ Qualitäts-Upgrade "
+                        f"({stored_quality.get('quality_label')} → {incoming_quality}): "
+                        f"`{filename}`",
+                        parse_mode='Markdown',
+                    )
+                elif stored_voe and source_voe_url and stored_voe == source_voe_url:
                     logging.info(f"[SKIP] Gleiche Quelle: {filename}")
                     await msg.edit_text(f"⏭ Bereits vorhanden (gleiche Quelle): `{filename}`", parse_mode='Markdown')
                     return True
@@ -4329,6 +4500,8 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
         caption = build_caption(filename, 'serie' if _is_fp_serie else content_type)
         await upload_with_telethon(filepath, caption, msg, progress_prefix=progress_prefix)
         _db_add(_db_ct, filename, is_anime, overwrite=(overwrite or update_due_to_new_source), voe_url=source_voe_url)
+        if _db_ct == 'film' and source_quality_label is not None:
+            _movie_quality_set(filename, source_quality_label)
         keep_downloaded_file = False
         await msg.edit_text(f"✅ Fertig!\n`{filename}.mp4`", parse_mode='Markdown')
         return True
@@ -4632,7 +4805,20 @@ async def process_bulk_films(msg, page_url: str, start_from: int = 0):
 
 
 def _parse_megakino_last_added_html(html: str, base_url: str) -> list[dict]:
+    from urllib.parse import urljoin
+
     soup = BeautifulSoup(html, 'html.parser')
+    # Die kompakte Last-Added-Liste kann pauschal "HD" anzeigen, obwohl die
+    # eigentliche Poster-Kachel noch TS/LD oder CAM/MIC trägt. Deshalb hat das
+    # poster__label derselben URL Vorrang.
+    poster_quality: dict[str, str] = {}
+    for poster in soup.select('a.poster[href]'):
+        label = poster.select_one('.poster__label')
+        if not label:
+            continue
+        poster_quality[urljoin(base_url, poster.get('href', '').strip())] = (
+            label.get_text(' ', strip=True)
+        )
     section = None
     for sec in soup.select('section.homeList'):
         title = sec.select_one('h2.sect__title')
@@ -4658,11 +4844,20 @@ def _parse_megakino_last_added_html(html: str, base_url: str) -> list[dict]:
         if ep_el:
             episode_text = ep_el.get_text(' ', strip=True)
         item_type = 'series' if '/serials/' in href else 'film'
+        quality_el = block.select_one('.listItem-quality')
+        quality_label = poster_quality.get(full_url) or (
+            quality_el.get_text(' ', strip=True) if quality_el else ''
+        )
         items.append({
             'type': item_type,
             'url': full_url,
             'title': title,
             'episode_text': episode_text,
+            'quality_label': quality_label,
+            'provisional_quality': (
+                _normalize_movie_quality(quality_label)
+                in _PROVISIONAL_MOVIE_QUALITIES
+            ) if item_type == 'film' else False,
         })
     return items
 
@@ -6254,27 +6449,60 @@ async def cmd_megakino_last_added(update: Update, context: ContextTypes.DEFAULT_
             return
 
         film_found = film_existing = film_queued = film_upgrades = 0
+        film_provisional_marked = 0
         series_found = series_complete = series_queued = 0
 
         for item in items:
             if item['type'] == 'film':
                 film_found += 1
+                quality_label = _normalize_movie_quality(
+                    item.get('quality_label')
+                )
+                current_provisional = (
+                    quality_label in _PROVISIONAL_MOVIE_QUALITIES
+                )
                 if _db_exists('film', item['title'], False):
-                    stored_source = _db_get_voe('film', item['title'], False)
-                    if stored_source:
+                    quality_state = _movie_quality_get(item['title'])
+                    if current_provisional:
+                        # Rückwirkender Backfill: Ein bereits vorhandener Film,
+                        # dessen aktuelle Megakino-Kachel TS/CAM meldet, bleibt
+                        # als späterer HD-Upgrade-Kandidat gespeichert.
+                        _movie_quality_set(item['title'], quality_label)
+                        film_provisional_marked += 1
                         film_existing += 1
                         continue
-                    film_upgrades += 1
-                    qmsg = await update.message.reply_text(
-                        f"♻️ Qualitäts-Upgrade in Queue: {item['title']}"
-                    )
+                    if quality_state and quality_state.get('provisional'):
+                        film_upgrades += 1
+                        qmsg = await update.message.reply_text(
+                            f"♻️ Megakino Qualitäts-Upgrade in Queue: "
+                            f"{item['title']} "
+                            f"({quality_state.get('quality_label')} → {quality_label})"
+                        )
+                    else:
+                        stored_source = _db_get_voe('film', item['title'], False)
+                        if stored_source:
+                            film_existing += 1
+                            continue
+                        film_upgrades += 1
+                        qmsg = await update.message.reply_text(
+                            f"♻️ Qualitäts-Upgrade in Queue: {item['title']}"
+                        )
                 else:
                     qmsg = await update.message.reply_text(
                         f"📥 In Queue: {item['title']}"
+                        + (f" [{quality_label} – späteres HD-Upgrade]" if current_provisional else "")
                     )
                 await _enqueue(chat_id, qmsg, process_video,
-                    {'type': 'video', 'url': item['url'], 'content_type': 'film', 'manual_title': item['title'], 'is_anime': False},
-                    item['url'], 'film', item['title'], False)
+                    {
+                        'type': 'video',
+                        'url': item['url'],
+                        'content_type': 'film',
+                        'manual_title': item['title'],
+                        'is_anime': False,
+                        'source_quality_label': quality_label,
+                    },
+                    item['url'], 'film', item['title'], False,
+                    "", False, False, quality_label)
                 film_queued += 1
                 continue
 
@@ -6302,7 +6530,8 @@ async def cmd_megakino_last_added(update: Update, context: ContextTypes.DEFAULT_
         await msg.edit_text(
             "✅ Megakino Last Added geprüft.\n\n"
             f"🎬 Filme: {film_found} gefunden, {film_existing} aktuell, "
-            f"{film_upgrades} Qualitäts-Upgrades, {film_queued} in Queue\n"
+            f"{film_upgrades} Qualitäts-Upgrades, {film_queued} in Queue, "
+            f"{film_provisional_marked} TS/CAM-Kandidaten markiert\n"
             f"📺 Serien: {series_found} gefunden, {series_complete} komplett, {series_queued} in Queue"
         )
     except Exception as e:
@@ -7206,7 +7435,8 @@ async def _restore_queue_job(app: Application, item_data: dict) -> None:
         await _enqueue(chat_id, msg, process_video, item_data,
                        item_data['url'], item_data['content_type'],
                        item_data.get('manual_title'), item_data.get('is_anime', False),
-                       "", False, item_data.get('direct_media_url', False), **common)
+                       "", False, item_data.get('direct_media_url', False),
+                       item_data.get('source_quality_label'), **common)
 
 
 async def _central_queue_worker(app: Application) -> None:
