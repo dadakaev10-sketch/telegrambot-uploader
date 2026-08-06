@@ -5672,9 +5672,11 @@ async def _enqueue(chat_id: int, msg, coro_func, persist: dict, *coro_args,
 
     # Der lokale Bot und explizite Producer sind reine Link-Produzenten:
     # keine neuen lokalen Downloads, kein queue.json-Eintrag. Erst wird die
-    # Quellseite auf VOE/Doodstream aufgelöst, danach kommt nur der Playerlink
-    # in PostgreSQL. Vom Worker reservierte Jobs tragen eine Claim-ID und
-    # durchlaufen weiterhin den normalen Downloadpfad darunter.
+    # Quellseite auf einen transportierbaren Player aufgelöst, danach kommt nur
+    # der Player-Job in PostgreSQL. Kinoger braucht zusätzlich die ursprüngliche
+    # Seite, weil kinoger.re ausschließlich als darin erzeugtes Iframe läuft.
+    # Vom Worker reservierte Jobs tragen eine Claim-ID und durchlaufen weiterhin
+    # den normalen Downloadpfad darunter.
     if (
         CENTRAL_QUEUE_ROLE in ('local', 'producer')
         and not persist.get('_central_job_id')
@@ -5709,9 +5711,24 @@ async def _enqueue(chat_id: int, msg, coro_func, persist: dict, *coro_args,
                 f"remote-bulk-{chat_id}-{id(msg)}",
             )
         elif job_type == 'kinoger_direct':
+            payload = {
+                key: value for key, value in persist.items()
+                if not key.startswith('_central_')
+            }
+            if priority:
+                payload['priority'] = await asyncio.to_thread(
+                    _central_queue.next_front_priority
+                )
+            job_id, created = await asyncio.to_thread(
+                _central_queue.enqueue,
+                payload,
+            )
+            position_hint = (
+                "ganz vorne" if payload.get('priority') else "ganz hinten"
+            )
             await msg.edit_text(
-                "❌ Kinoger liefert hier keinen VOE-/Doodstream-Playerlink. "
-                "Nach deiner Remote-Queue-Regel wurde nichts eingereiht."
+                f"{'✅' if created else 'ℹ️'} Remote Queue #{job_id} "
+                f"({position_hint})\n{payload.get('manual_title') or 'Kinoger'}"
             )
         else:
             _spawn_task(
