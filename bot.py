@@ -9,6 +9,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower().replace('-','') != 'utf8'
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 from datetime import UTC, datetime
+from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
@@ -4128,8 +4129,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             embed_url = data['embed_url']
             await msg.edit_text(f"🎬 *{ft}* → Embed gefunden\n`{embed_url[:80]}...`", parse_mode='Markdown')
             await _enqueue(chat_id, msg, process_kinoger_direct,
-                {'type': 'kinoger_direct', 'url': embed_url, 'manual_title': ft, 'db_content_type': 'film'},
-                embed_url, ft, 'film', False)
+                {'type': 'kinoger_direct', 'url': embed_url, 'manual_title': ft,
+                 'db_content_type': 'film', 'source_page_url': text},
+                embed_url, ft, 'film', False, '', text)
             return
 
         # Serie → Staffel-Wahl im /manuel-Stil aber mit vorbefüllten URLs
@@ -4168,6 +4170,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'title': title,
             'seasons_urls': seasons_urls,
             'missing_per_season': missing_per_season,
+            'source_page_url': text,
             'state': 'waiting_season',
         }
 
@@ -5096,21 +5099,47 @@ def _kinoger_best_quality_height(embed_url: str) -> int | None:
     return None
 
 
-async def _kinoger_resolve_browser_media(embed_url: str, preferred_qualities: tuple[str, ...] = ('720p', '1080p', '360p')) -> str | None:
+async def _kinoger_resolve_browser_media(
+    embed_url: str,
+    preferred_qualities: tuple[str, ...] = ('720p', '1080p', '360p'),
+    source_page_url: str | None = None,
+) -> str | None:
     """Resolve the short-lived playback URL that incvideo creates in a real browser."""
     try:
-        async with _open_browser(camoufox=False) as browser:
+        embed_host = (urlparse(embed_url).hostname or '').lower()
+        async with _open_browser(
+            camoufox=embed_host in ('kinoger.re', 'www.kinoger.re')
+        ) as browser:
             context = await browser.new_context()
             page = await context.new_page()
             media_urls: list[str] = []
 
             def _capture_media(response):
                 content_type = response.headers.get('content-type', '')
-                if 'remote_control.php' in response.url or content_type.startswith('video/'):
+                media_path = (urlparse(response.url).path or '').lower()
+                if media_path.endswith(('.vtt', '.srt', '.ass')):
+                    return
+                if (
+                    'remote_control.php' in response.url
+                    or content_type.startswith('video/')
+                    or response.request.resource_type == 'media'
+                    or media_path.endswith(('.m3u8', '.mp4', '.mpd'))
+                ):
                     media_urls.append(response.url)
 
             page.on('response', _capture_media)
-            await page.goto(embed_url, referer='https://kinoger.ch/', wait_until='networkidle', timeout=30000)
+            navigation_url = (
+                source_page_url
+                if embed_host in ('kinoger.re', 'www.kinoger.re') and source_page_url
+                else embed_url
+            )
+            await page.goto(
+                navigation_url,
+                referer='https://kinoger.ch/',
+                wait_until='domcontentloaded',
+                timeout=30000,
+            )
+            await page.wait_for_timeout(3500)
             html = await page.content()
             quality_urls = _kinoger_extract_quality_urls(html)
             for quality in preferred_qualities:
@@ -5123,7 +5152,30 @@ async def _kinoger_resolve_browser_media(embed_url: str, preferred_qualities: tu
                 await page.wait_for_timeout(2000)
                 break
             else:
-                await page.wait_for_timeout(3000)
+                # Der neue kinoger.re-Player existiert nur als dynamisch erzeugtes
+                # Iframe der ursprünglichen Kinoger-Seite. Einen sichtbaren
+                # Play-Button anklicken, damit die Medienanfrage ausgelöst wird.
+                target_frames = [
+                    frame for frame in page.frames
+                    if (urlparse(frame.url).hostname or '').lower()
+                    in ('kinoger.re', 'www.kinoger.re')
+                ]
+                for frame in target_frames or [page.main_frame]:
+                    for selector in (
+                        '#player-button-container',
+                        '.vds-play-button',
+                        '[aria-label="Play"]',
+                        'button[class*="play"]',
+                        '[class*="play-button"]',
+                    ):
+                        try:
+                            button = frame.locator(selector).first
+                            if await button.count() and await button.is_visible():
+                                await button.click(timeout=3000)
+                                break
+                        except Exception:
+                            continue
+                await page.wait_for_timeout(5000)
             await browser.close()
 
             for media_url in media_urls:
@@ -5220,7 +5272,10 @@ def _parse_kinoger_ollhd_seasons(html: str) -> dict[int, list[str]]:
             if not isinstance(raw_url, str):
                 continue
             url = raw_url.strip()
-            if url.startswith('https://voe.sx/e/'):
+            host = (urlparse(url).hostname or '').lower()
+            if url.startswith('https://voe.sx/e/') or host in (
+                'kinoger.re', 'www.kinoger.re'
+            ):
                 urls.append(url)
         if urls:
             seasons[s_idx] = urls
@@ -5279,17 +5334,27 @@ def _kinoger_scrape(url: str) -> dict:
         # single-embed shape as film unless the page explicitly exposes seasons.
         if len(seasons) == 1 and total_embeds == 1 and not has_season_ui:
             embed = next(iter(seasons.values()))[0]
-            return {'type': 'film', 'title': title, 'year': year, 'embed_url': embed}
-        return {'type': 'series', 'title': title, 'year': year, 'seasons': seasons}
+            return {
+                'type': 'film', 'title': title, 'year': year,
+                'embed_url': embed, 'source_page_url': url,
+            }
+        return {
+            'type': 'series', 'title': title, 'year': year,
+            'seasons': seasons, 'source_page_url': url,
+        }
 
     # Film? → iframe mit /embed/ src
     iframe = soup.find('iframe', src=re.compile(r'/embed/'))
     embed = iframe.get('src') if iframe else None
-    return {'type': 'film', 'title': title, 'year': year, 'embed_url': embed}
+    return {
+        'type': 'film', 'title': title, 'year': year,
+        'embed_url': embed, 'source_page_url': url,
+    }
 
 
 async def process_kinoger_direct(msg, mp4_url: str, manual_title: str, db_content_type: str = 'film',
-                                  is_anime: bool = False, progress_prefix: str = ''):
+                                  is_anime: bool = False, progress_prefix: str = '',
+                                  source_page_url: str | None = None):
     """Direkter Download für Kinoger: MP4-URL ist bekannt, kein Playwright nötig."""
     import time as _time
     type_emoji = {"film": "🎬", "serie": "📺", "anime": "🎌"}
@@ -5355,13 +5420,17 @@ async def process_kinoger_direct(msg, mp4_url: str, manual_title: str, db_conten
             if embed_match:
                 embed_url = f"https://fsst.online/embed/{embed_match.group(1)}/"
 
-        if '/embed/' in embed_url:
+        embed_host = (urlparse(embed_url).hostname or '').lower()
+        if '/embed/' in embed_url or embed_host in ('kinoger.re', 'www.kinoger.re'):
             referer = embed_url
             await msg.edit_text(
                 f"{icon} {progress_prefix}🔍 Löse Kinoger-Player auf...\n`{filename}`",
                 parse_mode='Markdown'
             )
-            browser_media = await _kinoger_resolve_browser_media(embed_url)
+            browser_media = await _kinoger_resolve_browser_media(
+                embed_url,
+                source_page_url=source_page_url,
+            )
             if browser_media:
                 download_url = browser_media
                 referer = 'https://incvideo1.online/' if 'remote_control.php' in browser_media else embed_url
@@ -7393,8 +7462,9 @@ async def _kinoger_handle_season(update: Update, context: ContextTypes.DEFAULT_T
                 embed_url, 'serie', ep_name, False)
         else:
             await _enqueue(chat_id, ep_msg, process_kinoger_direct,
-                {'type': 'kinoger_direct', 'url': embed_url, 'manual_title': ep_name, 'db_content_type': 'serie'},
-                embed_url, ep_name, 'serie', False)
+                {'type': 'kinoger_direct', 'url': embed_url, 'manual_title': ep_name,
+                 'db_content_type': 'serie', 'source_page_url': kg.get('source_page_url')},
+                embed_url, ep_name, 'serie', False, '', kg.get('source_page_url'))
         queued += 1
 
     await update.message.reply_text(f"✅ {queued}/{len(episodes)} Folgen in der Warteschlange.")
@@ -7503,7 +7573,8 @@ async def _restore_queue_job(app: Application, item_data: dict) -> None:
         await _enqueue(chat_id, msg, process_kinoger_direct, item_data,
                        item_data['url'], item_data['manual_title'],
                        item_data.get('db_content_type', 'film'),
-                       item_data.get('is_anime', False), **common)
+                       item_data.get('is_anime', False), '',
+                       item_data.get('source_page_url'), **common)
     else:
         await _enqueue(chat_id, msg, process_video, item_data,
                        item_data['url'], item_data['content_type'],
