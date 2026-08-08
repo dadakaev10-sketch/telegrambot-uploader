@@ -2604,6 +2604,27 @@ def _fetch_seriesstream_series(series_url: str) -> tuple[str, list[dict]]:
     return overview['title'], raw_episodes
 
 
+def _seriesstream_episode_title(episode_url: str) -> str | None:
+    """Erzeugt für eine einzelne SerienStream-Folge den kanonischen DB-Titel."""
+    normalized = _normalize_seriesstream_url(episode_url).rstrip('/')
+    match = re.search(r'/staffel-(\d+)/episode-(\d+)(?:/|$)', normalized, re.I)
+    if not match:
+        return None
+    season, episode = int(match.group(1)), int(match.group(2))
+    series_base_url = normalized[:match.start()]
+    response = requests.get(
+        series_base_url,
+        headers={'User-Agent': USER_AGENT, 'Referer': 'https://serienstream.to/'},
+        timeout=30,
+    )
+    response.raise_for_status()
+    overview = _sto_parse_html(response.text, series_base_url)
+    series_title = str(overview.get('title') or '').strip()
+    if not series_title:
+        return None
+    return f"{series_title} S{season:02d}E{episode:02d}"
+
+
 async def get_series_episodes(series_url: str, is_anime: bool = False) -> tuple[str, list[dict]]:
     """Liest alle Folgen. Gibt (series_title, episodes) zurück."""
     episodes = []
@@ -3516,6 +3537,13 @@ async def _publish_remote_video(
             else 'film'
         )
         title = persist.get('manual_title') or detected_title
+        if db_type == 'serie' and _is_seriesstream_url(page_url):
+            canonical_episode_title = await asyncio.to_thread(
+                _seriesstream_episode_title,
+                page_url,
+            )
+            if canonical_episode_title:
+                title = canonical_episode_title
         if not title:
             title = scrape_title(page_url)
         title = format_filename(title)
