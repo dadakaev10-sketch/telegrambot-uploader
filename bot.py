@@ -1948,6 +1948,21 @@ async def download_with_ytdlp(stream_url: str, filepath: str, referer: str | Non
     _active_proc = None
 
     if proc.returncode == 0:
+        if not os.path.exists(filepath):
+            logging.error("yt-dlp meldet Erfolg, aber Zieldatei fehlt: %s", filepath)
+            return False
+        file_ready, reason = _existing_download_is_complete(filepath)
+        if not file_ready:
+            logging.error(
+                "yt-dlp meldet Erfolg, aber Datei ist unbrauchbar: %s (%s)",
+                filepath,
+                reason,
+            )
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
+            return False
         logging.info("yt-dlp: fertig")
         return True
     if proc.returncode in (-9, -15):
@@ -2426,6 +2441,13 @@ async def upload_with_telethon(filepath: str, caption: str, progress_msg, progre
     from telethon.tl import functions, types
     from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo
     import time as _time
+
+    file_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+    if file_size <= 0:
+        raise RuntimeError(f"Upload abgebrochen: Datei ist leer oder fehlt: {filepath}")
+    file_ready, file_ready_reason = _existing_download_is_complete(filepath)
+    if not file_ready:
+        raise RuntimeError(f"Upload abgebrochen: Datei ist nicht gültig ({file_ready_reason})")
 
     meta       = get_video_metadata(filepath)
     thumb_path = await generate_thumbnail(filepath)
@@ -4498,6 +4520,11 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
                 success = await download_with_browser(stream_url, filepath, referer, cookie_str)
                 if not success:
                     logging.warning("Browser-Download fehlgeschlagen, Fallback auf yt-dlp...")
+                    try:
+                        if os.path.exists(filepath):
+                            os.remove(filepath)
+                    except OSError:
+                        pass
                     for key in ('progress_mode', 'segments_done', 'segments_total', 'percent'):
                         _dl_status.pop(key, None)
                     # Für yt-dlp/ffmpeg: Variant explizit auflösen (mittlere Qualität)
@@ -4516,6 +4543,27 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
 
             if not success or not os.path.exists(filepath):
                 await msg.edit_text("❌ Download fehlgeschlagen!")
+                return False
+
+            file_ready, downloaded_file_reason = _existing_download_is_complete(
+                filepath,
+                url,
+                direct_media_url,
+            )
+            if not file_ready:
+                logging.error(
+                    "Download wurde als Erfolg gemeldet, ist aber nicht uploadfähig: %s (%s)",
+                    filepath,
+                    downloaded_file_reason,
+                )
+                try:
+                    os.remove(filepath)
+                except OSError:
+                    pass
+                await msg.edit_text(
+                    f"❌ Download unvollständig/defekt: {downloaded_file_reason}\n"
+                    "Der Auftrag wird erneut versucht."
+                )
                 return False
 
         filepath = await downscale_if_needed(filepath, msg)
