@@ -1871,8 +1871,42 @@ async def download_with_browser(stream_url: str, filepath: str, referer: str | N
                 pass
 
             if proc.returncode != 0:
-                logging.error(f"ffmpeg-mux Fehler: {stderr.decode(errors='replace')[-300:]}")
-                return False
+                mux_error = stderr.decode(errors='replace')
+                logging.error(f"ffmpeg-mux Fehler: {mux_error[-300:]}")
+                if any(marker in mux_error.lower() for marker in (
+                    'decode error rate',
+                    'sample rate not set',
+                    'time_base',
+                    'received no packets',
+                )):
+                    logging.warning(
+                        "ffmpeg-mux: Audio ist defekt/unbrauchbar – neuer Versuch nur mit Video"
+                    )
+                    try:
+                        if os.path.exists(filepath):
+                            os.remove(filepath)
+                    except OSError:
+                        pass
+                    video_only_cmd = [
+                        'ffmpeg', '-analyzeduration', '100M', '-probesize', '100M',
+                        '-i', ts_path,
+                        '-map', '0:v:0', '-c:v', 'copy', '-an',
+                        '-movflags', '+faststart', '-loglevel', 'error', filepath, '-y',
+                    ]
+                    proc = await asyncio.create_subprocess_exec(
+                        *video_only_cmd,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.PIPE,
+                        creationflags=_NO_WINDOW,
+                    )
+                    _, stderr = await proc.communicate()
+                    if proc.returncode != 0:
+                        logging.error(
+                            f"ffmpeg-mux Video-only Fehler: {stderr.decode(errors='replace')[-300:]}"
+                        )
+                        return False
+                else:
+                    return False
             return True
         finally:
             await browser.close()
@@ -2063,7 +2097,41 @@ async def download_with_ffmpeg(stream_url: str, filepath: str, referer: str | No
         error_msg = stderr.decode(errors='replace')
         logging.error(f"ffmpeg Fehler: {error_msg[-500:]}")
         _raise_if_http_404(error_msg, "ffmpeg")
-        return False
+        if any(marker in error_msg.lower() for marker in (
+            'decode error rate',
+            'sample rate not set',
+            'time_base',
+            'received no packets',
+        )):
+            logging.warning(
+                "ffmpeg: Audio ist defekt/unbrauchbar – neuer Versuch nur mit Video"
+            )
+            try:
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+            except OSError:
+                pass
+            video_only_cmd = input_cmd + [
+                '-map', '0:v:0', '-c:v', 'copy', '-an',
+                '-movflags', '+faststart', '-aspect', '16:9',
+                '-loglevel', 'error', filepath, '-y',
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *video_only_cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                creationflags=_NO_WINDOW,
+            )
+            _active_proc = proc
+            _, stderr = await proc.communicate()
+            _active_proc = None
+            if proc.returncode != 0:
+                logging.error(
+                    f"ffmpeg Video-only Fehler: {stderr.decode(errors='replace')[-500:]}"
+                )
+                return False
+        else:
+            return False
     logging.info("ffmpeg: fertig")
     return True
 
