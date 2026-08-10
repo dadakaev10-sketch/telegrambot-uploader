@@ -5948,17 +5948,11 @@ async def _enqueue(chat_id: int, msg, coro_func, persist: dict, *coro_args,
     elif persist.get('type') == 'bulk_films':
         _watchlist_add('bulk_films', persist['url'], chat_id, False)
 
-    # Der lokale Bot und explizite Producer sind reine Link-Produzenten:
-    # keine neuen lokalen Downloads, kein queue.json-Eintrag. Erst wird die
-    # Quellseite auf einen transportierbaren Player aufgelöst, danach kommt nur
-    # der Player-Job in PostgreSQL. Kinoger braucht zusätzlich die ursprüngliche
-    # Seite, weil kinoger.re ausschließlich als darin erzeugtes Iframe läuft.
-    # Vom Worker reservierte Jobs tragen eine Claim-ID und durchlaufen weiterhin
-    # den normalen Downloadpfad darunter.
-    if (
-        CENTRAL_QUEUE_ROLE in ('local', 'producer')
-        and not persist.get('_central_job_id')
-    ):
+    # Sobald eine zentrale Queue konfiguriert ist, dürfen neue User-/Import-
+    # Aufträge niemals lokal in queue.json landen – auch nicht auf dem Worker.
+    # Nur bereits reservierte Remote-Jobs tragen eine Claim-ID und durchlaufen
+    # darunter den echten Download-/Uploadpfad.
+    if _central_queue and not persist.get('_central_job_id'):
         if not _central_queue:
             await msg.edit_text("❌ DATABASE_URL fehlt; Remote Queue nicht verfügbar.")
             return
