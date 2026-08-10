@@ -1865,11 +1865,6 @@ async def download_with_browser(stream_url: str, filepath: str, referer: str | N
                     creationflags=_NO_WINDOW,
                 )
                 _, stderr = await proc.communicate()
-            try:
-                os.remove(ts_path)
-            except Exception:
-                pass
-
             if proc.returncode != 0:
                 mux_error = stderr.decode(errors='replace')
                 logging.error(f"ffmpeg-mux Fehler: {mux_error[-300:]}")
@@ -1909,6 +1904,12 @@ async def download_with_browser(stream_url: str, filepath: str, referer: str | N
                     return False
             return True
         finally:
+            try:
+                ts_cleanup_path = locals().get('ts_path')
+                if ts_cleanup_path and os.path.exists(ts_cleanup_path):
+                    os.remove(ts_cleanup_path)
+            except Exception:
+                pass
             await browser.close()
 
 
