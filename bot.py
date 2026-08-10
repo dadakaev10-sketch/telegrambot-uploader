@@ -3705,7 +3705,7 @@ def _central_source_url_is_valid(source_url: str | None, page_url: str) -> bool:
 
 
 def _is_remote_player_source_url(url: str | None) -> bool:
-    """Erlaubt in PostgreSQL ausschließlich VOE-/Doodstream-Playerseiten.
+    """Erlaubt in PostgreSQL stabile Playerseiten (VOE/Dood/Dropstream).
 
     Beide Dienste verwenden neben ihren Hauptdomains wechselnde Aliasdomains.
     Der stabile Teil ist der Playerpfad /e/ bzw. /d/. Generische /embed/- oder
@@ -3719,8 +3719,9 @@ def _is_remote_player_source_url(url: str | None) -> bool:
     host = (parsed.hostname or '').lower()
     return (
         bool(re.match(r'^/(?:e|d)/[^/]+/?$', path))
+        or bool(re.match(r'^/embed-[^/]+\.html$', path))
         or ('voe.' in host and bool(path.strip('/')))
-        or ('dood' in host and bool(path.strip('/')))
+        or (any(marker in host for marker in ('dood', 'd0od', 'dr0pstream', 'dropstream')) and bool(path.strip('/')))
     )
 
 
@@ -6996,9 +6997,19 @@ async def cmd_hdfilme_latest(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     qmsg = await update.message.reply_text(
                         f"📥 HDFilme Film in Queue: {item['title']}"
                     )
-                await _enqueue(chat_id, qmsg, process_video,
-                    {'type': 'video', 'url': item['url'], 'content_type': 'film', 'manual_title': None, 'is_anime': False},
-                    item['url'], 'film', None, False)
+                payload = {
+                    'type': 'video',
+                    'url': item['url'],
+                    'content_type': 'film',
+                    'manual_title': None,
+                    'is_anime': False,
+                    'chat_id': chat_id,
+                }
+                if _central_queue:
+                    await _publish_remote_video(qmsg, payload)
+                else:
+                    await _enqueue(chat_id, qmsg, process_video, payload,
+                        item['url'], 'film', None, False)
                 film_queued += 1
                 continue
 
@@ -7027,9 +7038,24 @@ async def cmd_hdfilme_latest(update: Update, context: ContextTypes.DEFAULT_TYPE)
             qmsg = await update.message.reply_text(
                 f"📥 HDFilme Serie in Queue: {series_title}\n{len(missing_eps)} fehlende/neue Folge(n)"
             )
-            await _enqueue(chat_id, qmsg, process_full_series,
-                {'type': 'series', 'url': item['url'], 'is_anime': False},
-                item['url'], False)
+            payload = {
+                'type': 'series',
+                'url': item['url'],
+                'is_anime': False,
+                'chat_id': chat_id,
+            }
+            if _central_queue:
+                await _extract_central_series(
+                    context.application,
+                    chat_id,
+                    item['url'],
+                    0,
+                    False,
+                    qmsg,
+                )
+            else:
+                await _enqueue(chat_id, qmsg, process_full_series, payload,
+                    item['url'], False)
             series_queued += 1
 
         await msg.edit_text(
