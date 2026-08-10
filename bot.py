@@ -766,6 +766,59 @@ def _resolve_miixdrop_player(page_url: str) -> tuple[str, str | None, str]:
     return media_url, title, cookies
 
 
+async def _resolve_vinovo_player(page_url: str) -> tuple[str, str | None, str, str]:
+    """Extrahiert Vinovos signierte MP4-URL ohne Play-Klick.
+
+    Vinovo liefert zuerst per `/api/file/url/<code>` einen Token und setzt den
+    VideoJS-Source erst beim Play-Klick auf `<data-base>/stream/<token>`. Wenn
+    der Bot erst nach dem Play-Klick `currentSrc` liest, ist die URL für externe
+    Downloader teils schon 403. Deshalb lesen wir den API-Token in einer
+    frischen Minimal-Browser-Session und starten das Video nicht.
+    """
+    api_token: str | None = None
+    async with AsyncCamoufox(headless=True) as browser:
+        context = await browser.new_context(user_agent=USER_AGENT)
+        page = await context.new_page()
+
+        async def handle_response(response):
+            nonlocal api_token
+            if '/api/file/url/' not in response.url:
+                return
+            try:
+                data = await response.json()
+            except Exception:
+                return
+            token = data.get('token') if isinstance(data, dict) else None
+            if token:
+                api_token = token
+                logging.info('Vinovo API-Token empfangen: %s…', token[:24])
+
+        page.on('response', handle_response)
+        await page.goto(page_url, timeout=60000, wait_until='domcontentloaded')
+        for _ in range(30):
+            if api_token:
+                break
+            await asyncio.sleep(0.5)
+        if not api_token:
+            raise RuntimeError('Vinovo: API-Token nicht gefunden')
+        details = await page.evaluate('''() => {
+            const video = document.querySelector('video[data-base]');
+            const title = video?.getAttribute('data-title') || document.title || null;
+            return {base: video?.getAttribute('data-base') || null, title};
+        }''')
+        base = (details or {}).get('base')
+        if not base:
+            raise RuntimeError('Vinovo: data-base nicht gefunden')
+        all_cookies = await context.cookies()
+        referer_host = urlparse(page_url).hostname or ''
+        player_domain = '.'.join(referer_host.split('.')[-2:]) if referer_host else ''
+        relevant = [c for c in all_cookies if player_domain and player_domain in c.get('domain', '')]
+        cookie_str = '; '.join(f"{c['name']}={c['value']}" for c in (relevant or all_cookies[:5]))
+        stream_url = base.rstrip('/') + '/stream/' + api_token
+        title = (details or {}).get('title')
+        return stream_url, title, page.url, cookie_str
+
+
 @asynccontextmanager
 async def _open_browser(*, camoufox: bool, headless: bool = True):
     """Öffnet Camoufox nur für SerienStream, sonst Playwright Chromium."""
@@ -809,6 +862,15 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
             return None, miixdrop_title, page_url, cookie_str, page_url
         logging.info("Miixdrop: direkte MP4-URL extrahiert: %s", media_url[:120])
         return media_url, miixdrop_title, page_url, cookie_str, page_url
+
+    parsed_page_url = urlparse(page_url.strip())
+    if (parsed_page_url.hostname or '').lower().endswith('vinovo.to'):
+        logging.info("Vinovo: extrahiere signierte MP4-URL ohne Play-Klick")
+        media_url, vinovo_title, referer, cookie_str = await _resolve_vinovo_player(page_url)
+        if source_only:
+            return None, vinovo_title, referer, cookie_str, page_url
+        logging.info("Vinovo: direkte MP4-URL extrahiert: %s", media_url[:120])
+        return media_url, vinovo_title, referer, cookie_str, page_url
 
     is_direct_manual_player = (
         content_type == 'film' and _is_direct_player_url(page_url)
@@ -910,8 +972,22 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
 
         # Separate Slots pro Stream-Typ (m3u8 bevorzugt über MP4)
         _streams: dict[str, str | None] = {'m3u8': None, 'mpd': None, 'mp4': None}
+        _vinovo_api: dict[str, str | None] = {'token': None}
 
         from urllib.parse import urlparse as _urlparse
+
+        async def handle_response(response):
+            url = response.url
+            if '/api/file/url/' not in url:
+                return
+            try:
+                data = await response.json()
+            except Exception:
+                return
+            token = data.get('token') if isinstance(data, dict) else None
+            if token:
+                _vinovo_api['token'] = token
+                logging.info("Vinovo API-Token empfangen: %s…", token[:24])
 
         async def handle_request(request):
             url = request.url
@@ -943,6 +1019,7 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
                 logging.info(f">>> MP4 Stream: {url}")
 
         context.on('request', handle_request)
+        context.on('response', handle_response)
 
         def _current_stream() -> str | None:
             return _streams['m3u8'] or _streams['mpd'] or _streams['mp4']
@@ -974,6 +1051,25 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
                     break
                 await asyncio.sleep(0.5)
             await asyncio.sleep(2)
+            if 'vinovo.' in (_urlparse(player_url).hostname or '').lower():
+                for _ in range(20):
+                    if _vinovo_api['token']:
+                        break
+                    await asyncio.sleep(0.5)
+                if _vinovo_api['token']:
+                    try:
+                        vinovo_base = await page.evaluate('''() => {
+                            const video = document.querySelector('video[data-base]');
+                            return video ? video.getAttribute('data-base') : null;
+                        }''')
+                    except Exception:
+                        vinovo_base = None
+                    if vinovo_base:
+                        _streams['mp4'] = vinovo_base.rstrip('/') + '/stream/' + _vinovo_api['token']
+                        logging.info(
+                            "Vinovo: direkte MP4-URL aus API-Token gebaut: %s",
+                            _streams['mp4'][:200],
+                        )
 
         # ─── Film: Titel + data-src gleichzeitig per Playwright extrahieren ───
         elif content_type == 'film':
@@ -1424,14 +1520,14 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
 
         logging.info(f"Play-Loop: {len(player_frames)} relevante Frames (von {len(all_frames)})")
         for frame in player_frames:
-            if _streams['m3u8'] or _streams['mpd']:
+            if _current_stream():
                 break
             for selector in ['video', '.vjs-big-play-button', '[class*="play"]', '.plyr__control--overlaid', 'button[class*="play"]']:
                 try:
                     await frame.click(selector, timeout=1000)
                     logging.info(f"Play geklickt: {selector} in {frame.url[:60]}")
                     await asyncio.sleep(3)
-                    if _streams['m3u8'] or _streams['mpd']:
+                    if _current_stream():
                         break
                 except:
                     pass
@@ -1488,32 +1584,60 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
             except Exception as e:
                 logging.warning(f"DOM-Scan nach m3u8 fehlgeschlagen: {e}")
 
-        # Doodstream verwendet signierte CDN-URLs ohne `.mp4` im Pfad. Der
-        # Request-Handler kann sie daher nicht an einer Dateiendung erkennen,
-        # während der echte Wert nach dem Play-Klick in video.currentSrc steht.
-        if not _current_stream() and is_direct_manual_player:
+        async def _scan_direct_player_stream_from_dom() -> str | None:
+            """Findet direkte MP4-Streams aus Player-State/DOM.
+
+            Doodstream und Vinovo verwenden signierte CDN-URLs ohne `.mp4` im
+            Pfad. Der Request-Handler erkennt sie nicht an Dateiendungen. Bei
+            Vinovo liegt der fertige Wert nach `/api/file/url/<id>` als globale
+            `furl`-Variable vor (`<data-base>/stream/<token>`), bevor/auch wenn
+            `video.currentSrc` noch leer bleibt.
+            """
             try:
                 for frame in page.frames:
                     try:
-                        video_src = await frame.evaluate('''() => {
-                            const video = document.querySelector('video');
-                            if (!video) return null;
-                            return video.currentSrc || video.src ||
-                                video.querySelector('source')?.src || null;
+                        candidates = await frame.evaluate('''() => {
+                            const found = [];
+                            const add = value => {
+                                if (typeof value === 'string' && value) found.push(value);
+                            };
+                            try { add(window.furl); } catch(e) {}
+                            try {
+                                if (typeof videojs !== 'undefined') {
+                                    const player = videojs.getPlayer('video') || videojs('video');
+                                    add(player.currentSrc && player.currentSrc());
+                                    for (const src of (player.currentSources && player.currentSources()) || []) {
+                                        add(src && (src.src || src.file));
+                                    }
+                                }
+                            } catch(e) {}
+                            for (const video of document.querySelectorAll('video')) {
+                                add(video.currentSrc);
+                                add(video.src);
+                                add(video.querySelector('source')?.src);
+                            }
+                            return found;
                         }''')
-                        if video_src and video_src.startswith(('http://', 'https://')):
-                            _streams['mp4'] = video_src
-                            logging.info(
-                                ">>> Direkter Player-Stream aus video.currentSrc: %s",
-                                video_src[:200],
-                            )
-                            break
+                        for video_src in candidates or []:
+                            if video_src and video_src.startswith(('http://', 'https://')):
+                                return video_src
                     except Exception:
                         pass
             except Exception as error:
                 logging.warning(
                     "DOM-Scan nach direktem Player-Stream fehlgeschlagen: %s",
                     error,
+                )
+            return None
+
+        # Doodstream/Vinovo: signierte CDN-URLs aus Player-State/DOM lesen.
+        if not _current_stream() and is_direct_manual_player:
+            video_src = await _scan_direct_player_stream_from_dom()
+            if video_src:
+                _streams['mp4'] = video_src
+                logging.info(
+                    ">>> Direkter Player-Stream aus DOM/Player-State: %s",
+                    video_src[:200],
                 )
 
         stream_url = _current_stream()
@@ -1574,6 +1698,14 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
                         if _current_stream():
                             break
                         await asyncio.sleep(1)
+                    if not _current_stream():
+                        video_src = await _scan_direct_player_stream_from_dom()
+                        if video_src:
+                            _streams['mp4'] = video_src
+                            logging.info(
+                                ">>> Direkter Player-Stream nach Reload aus DOM/Player-State: %s",
+                                video_src[:200],
+                            )
                     stream_url = _current_stream()
                     if stream_url:
                         logging.info(
