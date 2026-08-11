@@ -5748,7 +5748,18 @@ async def process_kinoger_direct(msg, mp4_url: str, manual_title: str, db_conten
                 try:
                     part = filepath + '.part'
                     check = part if os.path.exists(part) else filepath
-                    size_mb = os.path.getsize(check) / (1024 * 1024) if os.path.exists(check) else 0
+                    if os.path.exists(check):
+                        stat = os.stat(check)
+                        # aria2c downloads direct HTTP files in parallel ranges. That can create
+                        # sparse .part files whose apparent size jumps to the final file size
+                        # immediately. st_blocks tracks actually written bytes, so progress stays
+                        # honest while .aria2 metadata exists.
+                        if check.endswith('.part') and os.path.exists(check + '.aria2'):
+                            size_mb = (stat.st_blocks * 512) / (1024 * 1024)
+                        else:
+                            size_mb = stat.st_size / (1024 * 1024)
+                    else:
+                        size_mb = 0
                     elapsed = int(_time.monotonic() - dl_start)
                     m, s = divmod(elapsed, 60)
                     _dl_status['size_mb'] = size_mb
