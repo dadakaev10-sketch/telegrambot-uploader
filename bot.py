@@ -889,7 +889,11 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
         # ALTCHA rechnet den Proof-of-Work im sichtbaren Browser zuverlässig aus;
         # camoufox löst das auch headless → kein Fenster pro Folge. Bei Problemen
         # SERIENSTREAM_HEADFUL=1 setzen, dann läuft der Browser sichtbar.
-        context = await browser.new_context()
+        storage_state_path = os.path.join(DOWNLOAD_DIR, 'seriesstream_storage_state.json')
+        context_kwargs = {}
+        if _is_seriesstream_url(page_url) and os.path.exists(storage_state_path):
+            context_kwargs['storage_state'] = storage_state_path
+        context = await browser.new_context(**context_kwargs)
 
         BLOCKED_SCRIPT_HOSTS = (
             'rutseasickmunch.com',
@@ -1338,28 +1342,55 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
                 # Nach jedem Reload werden Modal, ALTCHA und Formular vollständig
                 # neu aufgebaut. Alte Locator/Payloads dürfen nicht wiederverwendet
                 # werden, da der ALTCHA-Nachweis an die aktuelle Seite gebunden ist.
+                # Früher wurde nur VOE versucht. Manche Folgen haben aber sichtbare
+                # deutsche Alternativ-Provider oder VOE navigiert temporär nicht.
+                # Deshalb probieren die Seitenversuche verschiedene deutsche Player,
+                # bevorzugt VOE, danach Doodstream/Dropstream und sonst den nächsten.
                 modal = page.locator('#playerPrepareModal.show')
                 if await modal.count() == 0:
-                    voe_button = page.locator(
-                        '.link-box[data-provider-name="VOE"][data-language-id="1"]'
-                    )
-                    if await voe_button.count() == 1:
-                        try:
-                            await voe_button.click(timeout=15000)
-                        except Exception:
-                            clicked = await page.evaluate("""() => {
-                                const b = document.querySelector('.link-box[data-provider-name="VOE"][data-language-id="1"]');
-                                if (!b) return false;
-                                b.click();
-                                return true;
-                            }""")
-                            if not clicked:
-                                logging.warning(
-                                    "SerienStream: VOE-Button nicht auslösbar "
-                                    "(Seitenversuch %s/3)",
-                                    page_attempt,
-                                )
-                                continue
+                    provider_names = await page.evaluate("""() => {
+                        const preferred = ['VOE', 'Doodstream', 'Dood', 'Dropstream', 'Streamtape', 'Vidoza', 'Filemoon'];
+                        const buttons = Array.from(document.querySelectorAll('.link-box[data-language-id="1"]'));
+                        const names = buttons
+                            .map(b => b.getAttribute('data-provider-name') || '')
+                            .filter(Boolean);
+                        const unique = Array.from(new Set(names));
+                        unique.sort((a, b) => {
+                            const ai = preferred.findIndex(p => a.toLowerCase().includes(p.toLowerCase()));
+                            const bi = preferred.findIndex(p => b.toLowerCase().includes(p.toLowerCase()));
+                            return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+                        });
+                        return unique;
+                    }""")
+                    if provider_names:
+                        provider_name = provider_names[min(page_attempt - 1, len(provider_names) - 1)]
+                        logging.info(
+                            "SerienStream: versuche deutschen Provider %s (%s/%s)",
+                            provider_name,
+                            min(page_attempt, len(provider_names)),
+                            len(provider_names),
+                        )
+                        clicked = await page.evaluate("""(providerName) => {
+                            const buttons = Array.from(document.querySelectorAll('.link-box[data-language-id="1"]'));
+                            const b = buttons.find(el => (el.getAttribute('data-provider-name') || '') === providerName);
+                            if (!b) return false;
+                            b.click();
+                            return true;
+                        }""", provider_name)
+                        if not clicked:
+                            logging.warning(
+                                "SerienStream: Provider-Button nicht auslösbar: %s "
+                                "(Seitenversuch %s/3)",
+                                provider_name,
+                                page_attempt,
+                            )
+                            continue
+                    else:
+                        logging.warning(
+                            "SerienStream: kein deutscher Provider-Button gefunden "
+                            "(Seitenversuch %s/3)",
+                            page_attempt,
+                        )
                 try:
                     await modal.wait_for(timeout=30000)
                 except Exception:
@@ -1740,6 +1771,11 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
             stream_type = 'HLS' if _streams['m3u8'] else ('DASH' if _streams['mpd'] else 'MP4')
             logging.info(f"Stream gewählt: {stream_type} – {stream_url[:120]}")
 
+        if _is_seriesstream_url(page_url):
+            try:
+                await context.storage_state(path=storage_state_path)
+            except Exception as error:
+                logging.warning("SerienStream Storage-State konnte nicht gespeichert werden: %s", error)
         await browser.close()
 
     return stream_url, film_title, referer, cookie_str, source_voe_url
