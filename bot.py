@@ -8,8 +8,9 @@ if sys.stdout.encoding and sys.stdout.encoding.lower().replace('-','') != 'utf8'
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
@@ -7946,6 +7947,91 @@ async def _central_queue_worker(app: Application) -> None:
         except Exception:
             logging.error("Central-Queue-Polling Fehler:\n%s", traceback.format_exc())
         await asyncio.sleep(poll_seconds)
+
+
+class _AutoCommandMessage:
+    """Minimale Message-Hülle, damit bestehende Command-Handler geplant laufen."""
+
+    def __init__(self, app: Application, chat_id: int):
+        self._app = app
+        self._chat_id = chat_id
+
+    async def reply_text(self, text: str, **kwargs):
+        return await self._app.bot.send_message(self._chat_id, text, **kwargs)
+
+
+class _AutoCommandChat:
+    def __init__(self, chat_id: int):
+        self.id = chat_id
+
+
+class _AutoCommandUpdate:
+    def __init__(self, app: Application, chat_id: int):
+        self.effective_chat = _AutoCommandChat(chat_id)
+        self.message = _AutoCommandMessage(app, chat_id)
+
+
+def _auto_check_chat_id() -> int | None:
+    configured = os.getenv('AUTO_CHECK_CHAT_ID', '').strip()
+    if configured:
+        try:
+            return int(configured)
+        except ValueError:
+            logging.warning("AUTO_CHECK_CHAT_ID ist keine numerische Chat-ID: %s", configured)
+            return None
+    if len(ALLOWED_CHAT_IDS) == 1:
+        return next(iter(ALLOWED_CHAT_IDS))
+    return None
+
+
+def _auto_check_seconds_until_next(now: datetime) -> float:
+    hours = (10, 22)
+    candidates = [now.replace(hour=hour, minute=0, second=0, microsecond=0) for hour in hours]
+    candidates += [c + timedelta(days=1) for c in candidates]
+    target = min(candidate for candidate in candidates if candidate > now)
+    return max(1.0, (target - now).total_seconds())
+
+
+async def _scheduled_auto_checks(app: Application) -> None:
+    """Führt Watchcheck, Filmpalast und Megakino täglich um 10:00/22:00 aus."""
+    chat_id = _auto_check_chat_id()
+    if not chat_id:
+        logging.warning("Auto-Checks deaktiviert: AUTO_CHECK_CHAT_ID fehlt und ALLOWED_CHAT_IDS ist nicht eindeutig")
+        return
+    timezone_name = os.getenv('AUTO_CHECK_TIMEZONE', 'Europe/Berlin')
+    try:
+        tz = ZoneInfo(timezone_name)
+    except Exception:
+        logging.warning("AUTO_CHECK_TIMEZONE ungültig (%s), nutze Europe/Berlin", timezone_name)
+        tz = ZoneInfo('Europe/Berlin')
+
+    logging.info("Auto-Checks aktiv: Watchcheck, Filmpalast, Megakino um 10:00/22:00 %s an Chat %s", tz.key, chat_id)
+    while True:
+        now = datetime.now(tz)
+        sleep_seconds = _auto_check_seconds_until_next(now)
+        await asyncio.sleep(sleep_seconds)
+        started_at = datetime.now(tz)
+        logging.info("Auto-Checks starten (%s)", started_at.isoformat(timespec='minutes'))
+        try:
+            update = _AutoCommandUpdate(app, chat_id)
+            context = type('AutoCommandContext', (), {'application': app})()
+            await app.bot.send_message(
+                chat_id,
+                "⏰ Auto-Check startet: Watchcheck, Filmpalast Import, Megakino Last Added"
+            )
+            await cmd_watchcheck(update, context)
+            await cmd_filmpalast_import(update, context)
+            await cmd_megakino_last_added(update, context)
+            await app.bot.send_message(chat_id, "✅ Auto-Check abgeschlossen.")
+            logging.info("Auto-Checks abgeschlossen")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.error("Auto-Checks Fehler:\n%s", traceback.format_exc())
+            try:
+                await app.bot.send_message(chat_id, "❌ Auto-Check Fehler – Details im Server-Log.")
+            except Exception:
+                pass
 # ─── Main ────────────────────────────────────────
 
 async def main():
@@ -8065,6 +8151,7 @@ async def main():
 
         if RUN_TELEGRAM_POLLING:
             _spawn_task(_polling_watchdog(app), "telegram-polling-watchdog")
+            _spawn_task(_scheduled_auto_checks(app), "scheduled-auto-checks")
         else:
             logging.info("Worker-Modus: Telegram-Polling ist deaktiviert")
         await asyncio.Event().wait()
