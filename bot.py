@@ -2084,6 +2084,20 @@ async def download_with_ytdlp(stream_url: str, filepath: str, referer: str | Non
         '--merge-output-format', 'mp4',
         '--user-agent', USER_AGENT,
     ]
+
+    # Dood/Cloudatacdn and similar hosts often expose a single direct MP4 URL.
+    # yt-dlp's --concurrent-fragments only helps for segmented streams; for
+    # plain HTTP(S) files use aria2c range splitting when available.
+    parsed_url = stream_url.lower().split('?', 1)[0]
+    is_direct_http_file = stream_url.lower().startswith(('http://', 'https://')) and not parsed_url.endswith(('.m3u8', '.mpd'))
+    aria2c_bin = shutil.which('aria2c')
+    if aria2c_bin and is_direct_http_file:
+        logging.info("yt-dlp: nutze aria2c Parallel-Downloader für direkte HTTP-Datei")
+        cmd += [
+            '--external-downloader', aria2c_bin,
+            '--external-downloader-args',
+            'aria2c:-x 16 -s 16 -k 1M --file-allocation=none --continue=true --max-tries=5 --retry-wait=3',
+        ]
     if preferred_height:
         cmd += ['-f', f'bestvideo[height<={preferred_height}]+bestaudio/best[height<={preferred_height}]']
     if referer:
