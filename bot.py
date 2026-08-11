@@ -854,6 +854,15 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
     cookie_str = ""
     source_voe_url = None  # zum DB-Vergleich (erkennt Re-Uploads in besserer Qualität)
 
+    if _is_seriesstream_url(page_url) and source_only:
+        static_voe_url, static_title = await asyncio.to_thread(
+            _seriesstream_static_player_link,
+            page_url,
+        )
+        if static_voe_url:
+            logging.info("SerienStream: statischer Player-Link extrahiert: %s", static_voe_url)
+            return None, static_title, page_url, "", static_voe_url
+
     if 'miixdrop.com/' in page_url.lower():
         logging.info("Miixdrop: dekodiere statische Playerdaten ohne Browser")
         media_url, miixdrop_title, cookie_str = await asyncio.to_thread(
@@ -2897,6 +2906,71 @@ def _seriesstream_episode_title(episode_url: str) -> str | None:
     if not series_title:
         return None
     return f"{series_title} S{season:02d}E{episode:02d}"
+
+
+def _seriesstream_static_player_link(page_url: str) -> tuple[str | None, str | None]:
+    """Extrahiert SerienStream-Playerlinks ohne Browser/Turnstile.
+
+    Die Episodenseite enthält deutsche Provider-Buttons mit `data-play-url`.
+    Ein normaler GET auf diese `/r?t=...` URL liefert meist direkt einen 302 zum
+    stabilen VOE-/Player-Link. Das umgeht den Turnstile-Modalpfad, in dem
+    Headless-Camoufox hängen bleiben kann.
+    """
+    title = _seriesstream_episode_title(page_url)
+    try:
+        normalized = _normalize_seriesstream_url(page_url).rstrip('/')
+        session = requests.Session()
+        headers = {
+            'User-Agent': USER_AGENT,
+            'Referer': 'https://serienstream.to/',
+            'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8',
+        }
+        response = session.get(normalized, headers=headers, timeout=25)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        preferred = ('VOE', 'Doodstream', 'Dood', 'Dropstream', 'Streamtape', 'Vidoza', 'Filemoon')
+        buttons = soup.select('.link-box[data-language-id="1"][data-play-url]')
+        buttons.sort(
+            key=lambda button: next(
+                (
+                    index for index, name in enumerate(preferred)
+                    if name.lower() in (button.get('data-provider-name') or '').lower()
+                ),
+                999,
+            )
+        )
+        for button in buttons:
+            play_url = (button.get('data-play-url') or '').strip()
+            if not play_url:
+                continue
+            if play_url.startswith('//'):
+                redirect_url = 'https:' + play_url
+            elif play_url.startswith('/'):
+                parsed = urlparse(normalized)
+                redirect_url = f"{parsed.scheme}://{parsed.netloc}{play_url}"
+            elif play_url.startswith(('http://', 'https://')):
+                redirect_url = play_url
+            else:
+                continue
+            redirect = session.get(
+                redirect_url,
+                headers={**headers, 'Referer': normalized},
+                allow_redirects=False,
+                timeout=25,
+            )
+            location = redirect.headers.get('Location') or redirect.headers.get('location')
+            if location:
+                if location.startswith('//'):
+                    location = 'https:' + location
+                elif location.startswith('/'):
+                    parsed = urlparse(redirect_url)
+                    location = f"{parsed.scheme}://{parsed.netloc}{location}"
+                if _is_remote_player_source_url(location):
+                    return location, title
+        return None, title
+    except Exception as error:
+        logging.warning("SerienStream statische Player-Link-Extraktion fehlgeschlagen: %s", error)
+        return None, title
 
 
 async def get_series_episodes(series_url: str, is_anime: bool = False) -> tuple[str, list[dict]]:
