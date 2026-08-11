@@ -2911,66 +2911,146 @@ def _seriesstream_episode_title(episode_url: str) -> str | None:
 def _seriesstream_static_player_link(page_url: str) -> tuple[str | None, str | None]:
     """Extrahiert SerienStream-Playerlinks ohne Browser/Turnstile.
 
-    Die Episodenseite enthält deutsche Provider-Buttons mit `data-play-url`.
-    Ein normaler GET auf diese `/r?t=...` URL liefert meist direkt einen 302 zum
-    stabilen VOE-/Player-Link. Das umgeht den Turnstile-Modalpfad, in dem
-    Headless-Camoufox hängen bleiben kann.
+    Wichtig: pro Versuch wird absichtlich eine frische requests.Session genutzt.
+    SerienStream/Cloudflare gate't sonst häufig jede zweite Folge, wenn ein
+    Redirect-/Turnstile-Zustand in denselben Cookies weitergetragen wird.
     """
     title = _seriesstream_episode_title(page_url)
-    try:
-        normalized = _normalize_seriesstream_url(page_url).rstrip('/')
+    normalized = _normalize_seriesstream_url(page_url).rstrip('/')
+    user_agents = [
+        USER_AGENT,
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15',
+        'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0',
+    ]
+    preferred = ('VOE', 'Doodstream', 'Dood', 'Dropstream', 'Streamtape', 'Vidoza', 'Filemoon')
+
+    def _absolute_url(base_url: str, value: str) -> str | None:
+        value = (value or '').strip()
+        if not value:
+            return None
+        if value.startswith('//'):
+            return 'https:' + value
+        if value.startswith('/'):
+            parsed = urlparse(base_url)
+            return f"{parsed.scheme}://{parsed.netloc}{value}"
+        if value.startswith(('http://', 'https://')):
+            return value
+        return None
+
+    for attempt in range(1, int(os.getenv('SERIENSTREAM_STATIC_ATTEMPTS', '4')) + 1):
         session = requests.Session()
+        ua = user_agents[(attempt - 1) % len(user_agents)]
         headers = {
-            'User-Agent': USER_AGENT,
+            'User-Agent': ua,
             'Referer': 'https://serienstream.to/',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
         }
-        response = session.get(normalized, headers=headers, timeout=25)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        preferred = ('VOE', 'Doodstream', 'Dood', 'Dropstream', 'Streamtape', 'Vidoza', 'Filemoon')
-        buttons = soup.select('.link-box[data-language-id="1"][data-play-url]')
-        buttons.sort(
-            key=lambda button: next(
-                (
-                    index for index, name in enumerate(preferred)
-                    if name.lower() in (button.get('data-provider-name') or '').lower()
-                ),
-                999,
+        try:
+            response = session.get(normalized, headers=headers, timeout=25)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+            buttons = soup.select('.link-box[data-language-id="1"][data-play-url]')
+            buttons.sort(
+                key=lambda button: next(
+                    (
+                        index for index, name in enumerate(preferred)
+                        if name.lower() in (button.get('data-provider-name') or '').lower()
+                    ),
+                    999,
+                )
             )
-        )
-        for button in buttons:
-            play_url = (button.get('data-play-url') or '').strip()
-            if not play_url:
-                continue
-            if play_url.startswith('//'):
-                redirect_url = 'https:' + play_url
-            elif play_url.startswith('/'):
-                parsed = urlparse(normalized)
-                redirect_url = f"{parsed.scheme}://{parsed.netloc}{play_url}"
-            elif play_url.startswith(('http://', 'https://')):
-                redirect_url = play_url
-            else:
-                continue
-            redirect = session.get(
-                redirect_url,
-                headers={**headers, 'Referer': normalized},
-                allow_redirects=False,
-                timeout=25,
+            logging.info(
+                "SerienStream statisch: Versuch %s/%s, deutsche Provider=%s",
+                attempt,
+                os.getenv('SERIENSTREAM_STATIC_ATTEMPTS', '4'),
+                [button.get('data-provider-name') for button in buttons],
             )
-            location = redirect.headers.get('Location') or redirect.headers.get('location')
-            if location:
-                if location.startswith('//'):
-                    location = 'https:' + location
-                elif location.startswith('/'):
-                    parsed = urlparse(redirect_url)
-                    location = f"{parsed.scheme}://{parsed.netloc}{location}"
-                if _is_remote_player_source_url(location):
-                    return location, title
-        return None, title
-    except Exception as error:
-        logging.warning("SerienStream statische Player-Link-Extraktion fehlgeschlagen: %s", error)
-        return None, title
+            for button in buttons:
+                redirect_url = _absolute_url(normalized, button.get('data-play-url') or '')
+                if not redirect_url:
+                    continue
+                redirect_headers = {
+                    **headers,
+                    'Referer': normalized,
+                    'X-Requested-With': 'XMLHttpRequest',
+                }
+                redirect = session.get(
+                    redirect_url,
+                    headers=redirect_headers,
+                    allow_redirects=False,
+                    timeout=25,
+                )
+                location = redirect.headers.get('Location') or redirect.headers.get('location')
+                absolute_location = _absolute_url(redirect_url, location or '')
+                if absolute_location and _is_remote_player_source_url(absolute_location):
+                    return absolute_location, title
+
+                # Manche Antworten sind 200 HTML statt 302. Dann steht der Player-Link
+                # gelegentlich trotzdem im HTML/JS; suchen statt direkt Camoufox zu starten.
+                html = redirect.text or ''
+                match = re.search(
+                    r'https?://(?:[^\s\"\']+\.)?(?:voe\.sx|voe\.to|dood\.[a-z]+|doodstream\.[a-z]+|dropstream\.[a-z]+)/(?:e|d)/[A-Za-z0-9_-]+',
+                    html,
+                    re.I,
+                )
+                if match and _is_remote_player_source_url(match.group(0)):
+                    return match.group(0), title
+
+                bridge_token_match = re.search(r'var\s+t\s*=\s*"([^"]+)"', html)
+                csrf_input = soup.select_one('#player-prepare-form input[name="_token"]')
+                gate_root = soup.select_one('#episode-redirect-gate-root')
+                sitekey = gate_root.get('data-turnstile-sitekey') if gate_root else ''
+                if bridge_token_match and csrf_input and sitekey:
+                    try:
+                        solver_timeout = int(os.getenv('SERIENSTREAM_TURNSTILE_TIMEOUT', '80'))
+                        solver = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'scripts', 'turnstile_solver.py')
+                        logging.info("SerienStream statisch: löse Turnstile für %s", title or normalized)
+                        token_output = subprocess.check_output(
+                            [sys.executable, solver, sitekey, normalized, str(solver_timeout)],
+                            text=True,
+                            stderr=subprocess.DEVNULL,
+                            timeout=solver_timeout + 25,
+                        )
+                        turnstile_token = token_output.strip().splitlines()[-1]
+                        post = session.post(
+                            f"{urlparse(normalized).scheme}://{urlparse(normalized).netloc}/r",
+                            headers={**headers, 'Referer': normalized},
+                            data={
+                                '_token': csrf_input.get('value') or '',
+                                't': bridge_token_match.group(1),
+                                'cf-turnstile-response': turnstile_token,
+                            },
+                            allow_redirects=False,
+                            timeout=25,
+                        )
+                        post_location = post.headers.get('Location') or post.headers.get('location')
+                        absolute_post_location = _absolute_url(normalized, post_location or '')
+                        if absolute_post_location and _is_remote_player_source_url(absolute_post_location):
+                            logging.info("SerienStream statisch: Turnstile-POST lieferte Player-Link")
+                            return absolute_post_location, title
+                    except Exception as error:
+                        logging.warning("SerienStream statisch: Turnstile-Fallback fehlgeschlagen: %s", error)
+                logging.info(
+                    "SerienStream statisch: kein 302 für %s (HTTP %s, %s Bytes) – neue Session",
+                    button.get('data-provider-name') or 'Provider',
+                    redirect.status_code,
+                    len(html),
+                )
+            if attempt < int(os.getenv('SERIENSTREAM_STATIC_ATTEMPTS', '4')):
+                _time.sleep(float(os.getenv('SERIENSTREAM_STATIC_RETRY_DELAY', '2.5')))
+        except Exception as error:
+            logging.warning(
+                "SerienStream statische Player-Link-Extraktion Versuch %s fehlgeschlagen: %s",
+                attempt,
+                error,
+            )
+            if attempt < int(os.getenv('SERIENSTREAM_STATIC_ATTEMPTS', '4')):
+                _time.sleep(float(os.getenv('SERIENSTREAM_STATIC_RETRY_DELAY', '2.5')))
+    return None, title
 
 
 async def get_series_episodes(series_url: str, is_anime: bool = False) -> tuple[str, list[dict]]:
