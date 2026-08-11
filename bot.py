@@ -4179,9 +4179,9 @@ async def cmd_clear_remote_queue(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ `DATABASE_URL` fehlt.", parse_mode='Markdown')
         return
     await update.message.reply_text(
-        "⚠️ Wirklich die gesamte Remote Queue leeren?\n"
-        "Auch als „processing“ markierte Jobs und laufende Staffel-Entwürfe "
-        "werden in PostgreSQL abgebrochen.",
+        "⚠️ Wirklich die Remote Queue leeren?\n"
+        "Nur offene Download-Jobs (`queued`/`processing`) werden abgebrochen. "
+        "Staffel-Entwürfe bleiben erhalten.",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton(
                 "🗑 Ja, alles löschen",
@@ -4215,7 +4215,7 @@ async def handle_clear_remote_queue(update: Update, context: ContextTypes.DEFAUL
     await edit_once(
         f"🗑 Remote Queue geleert.\n"
         f"Jobs entfernt: {result['cancelled']}\n"
-        f"Staffel-Entwürfe abgebrochen: {result['cancelled_batches']}"
+        "Staffel-Entwürfe bleiben erhalten."
     )
 
 

@@ -693,7 +693,13 @@ class CentralQueue:
             return {'jobs': selected, 'count': len(selected)}
 
     def clear_waiting_jobs(self) -> dict[str, int]:
-        """Leert alle offenen Jobs und Batch-Entwürfe der zentralen Queue."""
+        """Leert nur offene Download-Jobs der zentralen Queue.
+
+        Staffel-Batches in ``download_batches`` sind Entwürfe/Link-Sammlungen,
+        keine sichtbaren Queue-Downloadjobs. Sie dürfen beim normalen
+        "Remote Queue leeren" nicht abgebrochen werden, weil Nutzer damit nur
+        die aktuell sichtbaren Downloadjobs entfernen wollen.
+        """
         with self.connect() as con:
             cancelled = con.execute(
                 """
@@ -703,14 +709,7 @@ class CentralQueue:
                 WHERE status IN ('queued','processing')
                 """,
             ).rowcount
-            cancelled_batches = con.execute(
-                """
-                UPDATE download_batches
-                SET status='cancelled', updated_at=now()
-                WHERE status IN ('collecting','ready')
-                """
-            ).rowcount
             return {
                 'cancelled': int(cancelled),
-                'cancelled_batches': int(cancelled_batches),
+                'cancelled_batches': 0,
             }
