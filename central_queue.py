@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from datetime import timedelta
 
 import psycopg
@@ -118,6 +119,83 @@ class CentralQueue:
     def init(self) -> None:
         with self.connect() as con:
             con.execute(SCHEMA_SQL)
+            self._migrate_open_film_dedupe_keys(con)
+
+    @staticmethod
+    def _film_identity(payload: dict) -> dict | None:
+        """Stabile Filmidentität ohne Quelle, Genres oder Satzzeichen."""
+        content_type = payload.get('content_type') or payload.get('db_content_type')
+        if content_type != 'film':
+            return None
+        title = str(payload.get('manual_title') or '').strip()
+        match = re.search(r'^(.*?)\s*\((\d{4})\)', title)
+        if not match:
+            return None
+        name = unicodedata.normalize('NFKC', match.group(1)).casefold()
+        name = name.replace('&', ' und ')
+        name = ''.join(re.findall(r'\w+', name, flags=re.UNICODE))
+        if not name:
+            return None
+        return {'kind': 'film', 'title': name, 'year': int(match.group(2))}
+
+    def _migrate_open_film_dedupe_keys(self, con) -> None:
+        """Stellt bestehende offene Filme auf Titel+Jahr um und entfernt Dubletten."""
+        con.execute("SELECT pg_advisory_xact_lock(hashtext('download_jobs_film_dedupe'))")
+        rows = con.execute(
+            """
+            SELECT id,payload,status FROM download_jobs
+            WHERE status IN ('queued','processing')
+            ORDER BY CASE status WHEN 'processing' THEN 0 ELSE 1 END,
+                     COALESCE(queue_position,id),id
+            FOR UPDATE
+            """
+        ).fetchall()
+        groups: dict[str, list[dict]] = {}
+        for raw in rows:
+            row = dict(raw)
+            identity = self._film_identity(row.get('payload') or {})
+            if identity is None:
+                continue
+            key = hashlib.sha256(
+                json.dumps(identity, ensure_ascii=False, sort_keys=True).encode('utf-8')
+            ).hexdigest()
+            groups.setdefault(key, []).append(row)
+
+        # Temporäre Schlüssel verhindern Konflikte mit dem partiellen UNIQUE-Index,
+        # während alte URL-basierte Schlüssel auf die neue Identität wechseln.
+        for jobs in groups.values():
+            for job in jobs:
+                con.execute(
+                    "UPDATE download_jobs SET dedupe_key=%s WHERE id=%s",
+                    (f"migration-{job['id']}-{job.get('status')}", job['id']),
+                )
+        for key, jobs in groups.items():
+            keeper, *duplicates = jobs
+            con.execute(
+                "UPDATE download_jobs SET dedupe_key=%s,updated_at=now() WHERE id=%s",
+                (key, keeper['id']),
+            )
+            # Einen bereits von einem Worker verarbeiteten zweiten Job niemals
+            # unter ihm abbrechen. Nur noch wartende Dubletten werden entfernt.
+            queued_duplicates = [job for job in duplicates if job['status'] == 'queued']
+            processing_duplicates = [job for job in duplicates if job['status'] == 'processing']
+            for job in processing_duplicates:
+                con.execute(
+                    "UPDATE download_jobs SET dedupe_key=%s WHERE id=%s",
+                    (f"processing-film-{job['id']}", job['id']),
+                )
+            if queued_duplicates:
+                duplicate_ids = [int(job['id']) for job in queued_duplicates]
+                con.execute(
+                    """
+                    UPDATE download_jobs
+                    SET status='cancelled',locked_by=NULL,locked_at=NULL,
+                        last_error='Doppelter offener Filmjob (gleicher Titel und Jahr)',
+                        updated_at=now()
+                    WHERE id=ANY(%s)
+                    """,
+                    (duplicate_ids,),
+                )
 
     def next_front_priority(self) -> int:
         """Reserviert eine Priorität oberhalb aller momentan offenen Jobs."""
@@ -140,13 +218,15 @@ class CentralQueue:
 
     @staticmethod
     def dedupe_key(payload: dict) -> str:
-        identity = {
-            'type': payload.get('type'),
-            'url': payload.get('url'),
-            'content_type': payload.get('content_type'),
-            'manual_title': payload.get('manual_title'),
-            'is_anime': bool(payload.get('is_anime')),
-        }
+        identity = CentralQueue._film_identity(payload)
+        if identity is None:
+            identity = {
+                'type': payload.get('type'),
+                'url': payload.get('url'),
+                'content_type': payload.get('content_type'),
+                'manual_title': payload.get('manual_title'),
+                'is_anime': bool(payload.get('is_anime')),
+            }
         raw = json.dumps(identity, ensure_ascii=False, sort_keys=True).encode('utf-8')
         return hashlib.sha256(raw).hexdigest()
 
