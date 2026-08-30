@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS download_jobs (
     dedupe_key TEXT NOT NULL,
     payload JSONB NOT NULL,
     status TEXT NOT NULL DEFAULT 'queued'
-        CHECK (status IN ('queued', 'processing', 'completed', 'dead', 'cancelled')),
+        CHECK (status IN ('queued', 'processing', 'paused', 'completed', 'dead', 'cancelled')),
     attempts INTEGER NOT NULL DEFAULT 0,
     available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     locked_by TEXT,
@@ -59,6 +59,9 @@ ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAUL
 ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
 ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS batch_id BIGINT REFERENCES download_batches(id);
 ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS queue_position BIGINT;
+ALTER TABLE download_jobs DROP CONSTRAINT IF EXISTS download_jobs_status_check;
+ALTER TABLE download_jobs ADD CONSTRAINT download_jobs_status_check
+    CHECK (status IN ('queued', 'processing', 'paused', 'completed', 'dead', 'cancelled'));
 
 -- Bestehende Jobs einmalig in ihrer bisherigen effektiven Reihenfolge
 -- nummerieren. Danach kann die Reihenfolge unabhängig von IDs gespeichert
@@ -93,9 +96,10 @@ CREATE INDEX IF NOT EXISTS download_jobs_claim_idx
     ON download_jobs (status, available_at, id);
 CREATE INDEX IF NOT EXISTS download_jobs_queue_position_idx
     ON download_jobs (status, queue_position, id);
-CREATE UNIQUE INDEX IF NOT EXISTS download_jobs_open_dedupe_uq
+DROP INDEX IF EXISTS download_jobs_open_dedupe_uq;
+CREATE UNIQUE INDEX download_jobs_open_dedupe_uq
     ON download_jobs (dedupe_key)
-    WHERE status IN ('queued', 'processing');
+    WHERE status IN ('queued', 'processing', 'paused');
 """
 
 
@@ -236,7 +240,7 @@ class CentralQueue:
         with self.connect() as con:
             con.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (key,))
             existing = con.execute(
-                "SELECT id FROM download_jobs WHERE dedupe_key=%s AND status IN ('queued','processing')",
+                "SELECT id FROM download_jobs WHERE dedupe_key=%s AND status IN ('queued','processing','paused')",
                 (key,),
             ).fetchone()
             if existing:
@@ -263,7 +267,7 @@ class CentralQueue:
                 key = self.dedupe_key(clean)
                 con.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (key,))
                 row = con.execute(
-                    "SELECT id FROM download_jobs WHERE dedupe_key=%s AND status IN ('queued','processing')",
+                    "SELECT id FROM download_jobs WHERE dedupe_key=%s AND status IN ('queued','processing','paused')",
                     (key,),
                 ).fetchone()
                 if row:
@@ -347,7 +351,7 @@ class CentralQueue:
                 raise RuntimeError("Remote-Queue-Batch wurde abgebrochen")
             con.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (key,))
             row = con.execute(
-                "SELECT id FROM download_jobs WHERE dedupe_key=%s AND status IN ('queued','processing')",
+                "SELECT id FROM download_jobs WHERE dedupe_key=%s AND status IN ('queued','processing','paused')",
                 (key,),
             ).fetchone()
             if row:
@@ -528,7 +532,7 @@ class CentralQueue:
                        j.locked_by,j.batch_id,j.queue_position,b.title AS batch_title
                 FROM download_jobs j
                 LEFT JOIN download_batches b ON b.id=j.batch_id
-                WHERE j.status='processing'
+                WHERE j.status IN ('processing','paused')
                    OR (
                        j.status='queued'
                        AND (j.batch_id IS NULL OR b.status='ready')
@@ -546,6 +550,42 @@ class CentralQueue:
                 (limit,),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def set_group_paused(self, anchor_job_id: int, paused: bool) -> dict | None:
+        """Pausiert oder reaktiviert einen vollständigen wartenden Queue-Block."""
+        with self.connect() as con:
+            con.execute("SELECT pg_advisory_xact_lock(hashtext('download_jobs_queue_order'))")
+            rows = con.execute(
+                """
+                SELECT j.id,j.status,j.payload,j.batch_id,j.queue_position
+                FROM download_jobs j
+                LEFT JOIN download_batches b ON b.id=j.batch_id
+                WHERE j.status IN ('queued','paused')
+                  AND (j.batch_id IS NULL OR b.status='ready')
+                ORDER BY COALESCE(j.queue_position,j.id),j.id
+                FOR UPDATE OF j
+                """
+            ).fetchall()
+            rows = [dict(row) for row in rows]
+            anchor = next(
+                (row for row in rows if int(row['id']) == int(anchor_job_id)), None
+            )
+            if not anchor:
+                return None
+            key = self._queue_group_key(anchor)
+            selected = [row for row in rows if self._queue_group_key(row) == key]
+            ids = [int(row['id']) for row in selected]
+            target = 'paused' if paused else 'queued'
+            con.execute(
+                """
+                UPDATE download_jobs
+                SET status=%s,updated_at=now(),locked_by=NULL,locked_at=NULL,
+                    last_error=%s
+                WHERE id=ANY(%s)
+                """,
+                (target, 'Vom Benutzer pausiert' if paused else None, ids),
+            )
+            return {'count': len(ids), 'jobs': selected, 'paused': paused}
 
     @staticmethod
     def _queue_group_key(row: dict) -> tuple:
@@ -575,7 +615,7 @@ class CentralQueue:
                 SELECT j.id,j.payload,j.batch_id,j.queue_position,b.title AS batch_title
                 FROM download_jobs j
                 LEFT JOIN download_batches b ON b.id=j.batch_id
-                WHERE j.status='queued'
+                WHERE j.status IN ('queued','paused')
                   AND (j.batch_id IS NULL OR b.status='ready')
                 ORDER BY
                     CASE
@@ -647,7 +687,7 @@ class CentralQueue:
                 SELECT j.id,j.payload,j.batch_id,j.queue_position
                 FROM download_jobs j
                 LEFT JOIN download_batches b ON b.id=j.batch_id
-                WHERE j.status='queued'
+                WHERE j.status IN ('queued','paused')
                   AND (j.batch_id IS NULL OR b.status='ready')
                 ORDER BY COALESCE(j.queue_position,j.id),j.id
                 FOR UPDATE OF j

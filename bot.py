@@ -35,7 +35,7 @@ from telegram.ext import (
 )
 from telethon import TelegramClient
 from camoufox.async_api import AsyncCamoufox
-from playwright.async_api import async_playwright
+from playwright.async_api import Error as PlaywrightError, async_playwright
 from central_media_db import CentralMediaDB
 from central_queue import CentralQueue
 
@@ -112,8 +112,13 @@ ANIME_BASE = "https://aniworld.to"
 _dl_queue: asyncio.Queue = asyncio.Queue()
 _dl_pending: list[dict] = []
 _dl_active:  dict | None = None          # gerade verarbeitetes Item
+_dl_active_workers: dict[int, dict] = {} # parallele Pipeline-Slots
 _active_proc: asyncio.subprocess.Process | None = None  # laufender ffmpeg/yt-dlp Prozess
 _dl_status: dict = {}                   # aktueller Download-Status für /status
+try:
+    PIPELINE_CONCURRENCY = max(1, min(4, int(os.getenv('PIPELINE_CONCURRENCY', '2'))))
+except ValueError as error:
+    raise ValueError("PIPELINE_CONCURRENCY muss eine Zahl von 1 bis 4 sein") from error
 _seriesstream_extraction_semaphore = asyncio.Semaphore(
     SERIENSTREAM_EXTRACTION_CONCURRENCY
 )
@@ -124,6 +129,11 @@ _reupload_choices: dict[str, bool]          = {}
 _central_worker_task: asyncio.Task | None = None
 
 PERMANENT_JOB_FAILURE = 'permanent_job_failure'
+
+
+def _failed_retry_max_attempts() -> int:
+    """Maximale Anzahl echter Verarbeitungsversuche vor Dead-Letter."""
+    return max(1, int(os.getenv('FAILED_RETRY_MAX_ATTEMPTS', '3')))
 
 
 def _utc_now_iso() -> str:
@@ -137,16 +147,23 @@ class PermanentMediaUnavailable(RuntimeError):
 
 def _raise_if_http_404(error_text: str, source: str) -> None:
     """Klassifiziert einen bestätigten HTTP-404 als dauerhaften Medienfehler."""
+    if _looks_like_http_404(error_text):
+        raise PermanentMediaUnavailable(
+            f"{source} meldet HTTP 404 – Datei wurde entfernt"
+        )
+
+
+def _looks_like_http_404(error_text: str | None) -> bool:
+    """Erkennt bestätigte 404-Fehler auch aus yt-dlp/ffmpeg/Worker-Texten."""
+    text = error_text or ''
     patterns = (
         r"\bHTTP\s+(?:Error\s+)?404\b",
         r"\bserver returned 404\b",
         r"\bstatus(?:=| code[:=]?\s*)404\b",
         r"\b404\s+Not Found\b",
+        r"\b404\s*-\s*Nicht gefunden\b",
     )
-    if any(re.search(pattern, error_text, re.IGNORECASE) for pattern in patterns):
-        raise PermanentMediaUnavailable(
-            f"{source} meldet HTTP 404 – Datei wurde entfernt"
-        )
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
 
 
 class _LazyTelegramMessage:
@@ -209,9 +226,9 @@ MAIN_MENU = ReplyKeyboardMarkup(
     [
         ["▶️ Remote Queue Download", "🗑 Remote Queue leeren"],
         ["⚡ URL vorreihen", "🎬 Film Import"],
-        ["🆕 Megakino Last Added", "🆕 HDFilme Latest"],
-        ["🆕 Filmpalast Import", "📊 Status"],
-        ["🔍 Watchcheck", "📋 Remote Queue"],
+        ["🆕 Megakino Last Added", "🆕 Filmpalast Import"],
+        ["🔍 Watchcheck", "📊 Status"],
+        ["📋 Remote Queue"],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -223,7 +240,6 @@ MAIN_MENU_TEXTS = {
     "⚡ Serie vorreihen",
     "🎬 Film Import",
     "🆕 Megakino Last Added",
-    "🆕 HDFilme Latest",
     "🆕 Filmpalast Import",
     "📊 Status",
     "🔍 Watchcheck",
@@ -863,6 +879,15 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
             logging.info("SerienStream: statischer Player-Link extrahiert: %s", static_voe_url)
             return None, static_title, page_url, "", static_voe_url
 
+    if content_type == 'anime' and 'aniworld.to' in page_url and source_only:
+        static_player_url = await asyncio.to_thread(
+            _aniworld_static_player_link,
+            page_url,
+        )
+        if static_player_url:
+            logging.info("AniWorld: statischer Player-Link extrahiert: %s", static_player_url)
+            return None, None, page_url, "", static_player_url
+
     if 'miixdrop.com/' in page_url.lower():
         logging.info("Miixdrop: dekodiere statische Playerdaten ohne Browser")
         media_url, miixdrop_title, cookie_str = await asyncio.to_thread(
@@ -1056,11 +1081,36 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
             # Camoufox passiert die vorgeschaltete Cloudflare-Prüfung meist
             # selbstständig. Auf den echten Player warten, statt bereits auf der
             # Zwischenprüfung nach Video-Requests zu suchen.
-            for _ in range(60):
-                challenge = await page.locator(
-                    'iframe[src*="challenges.cloudflare.com"]'
-                ).count()
-                title = await page.title()
+            for navigation_attempt in range(60):
+                try:
+                    challenge = await page.locator(
+                        'iframe[src*="challenges.cloudflare.com"]'
+                    ).count()
+                    title = await page.title()
+                except PlaywrightError as error:
+                    error_text = str(error).lower()
+                    if not any(marker in error_text for marker in (
+                        'execution context was destroyed',
+                        'cannot find context with specified id',
+                    )):
+                        raise
+                    # VOE/Cloudflare ersetzt beim Redirect das Dokument. Eine
+                    # DOM-Abfrage, die genau in diesem kurzen Fenster startet,
+                    # gehört zum alten JS-Kontext und muss im neuen Dokument
+                    # wiederholt werden; der gesamte Queue-Job darf deshalb
+                    # nicht fehlschlagen.
+                    logging.info(
+                        "Player navigiert noch; DOM-Prüfung wird wiederholt (%s/60)",
+                        navigation_attempt + 1,
+                    )
+                    try:
+                        await page.wait_for_load_state(
+                            'domcontentloaded', timeout=3000
+                        )
+                    except PlaywrightError:
+                        pass
+                    await asyncio.sleep(0.25)
+                    continue
                 if not challenge and 'just a moment' not in title.lower():
                     break
                 await asyncio.sleep(0.5)
@@ -1790,7 +1840,17 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
     return stream_url, film_title, referer, cookie_str, source_voe_url
 
 
-def resolve_normal_quality(master_url: str, referer: str | None, cookie_str: str) -> str:
+def _one_time_preferred_height(title: str | None) -> int | None:
+    """Einmalige Ausnahme: S.W.A.T. Staffel 1–7 höchstens in 480p."""
+    normalized = unicodedata.normalize('NFKC', title or '').casefold()
+    normalized = re.sub(r'[^a-z0-9]+', '', normalized)
+    return 480 if re.search(r'^swats0?([1-7])e\d+', normalized) else None
+
+
+def resolve_normal_quality(
+    master_url: str, referer: str | None, cookie_str: str,
+    preferred_height: int | None = None,
+) -> str:
     """Parsed die master.m3u8 und gibt die URL der 'n' (normal/720p) Qualität zurück.
     Fallback: original master_url wenn Parsing fehlschlägt."""
     try:
@@ -1804,6 +1864,31 @@ def resolve_normal_quality(master_url: str, referer: str | None, cookie_str: str
         r.raise_for_status()
 
         lines = [l.strip() for l in r.text.splitlines() if l.strip()]
+        if preferred_height and '#EXT-X-STREAM-INF' in r.text:
+            from urllib.parse import urljoin
+            variants = []
+            stream_info = None
+            for line in lines:
+                if line.startswith('#EXT-X-STREAM-INF'):
+                    stream_info = line
+                elif not line.startswith('#') and stream_info:
+                    resolution = re.search(r'RESOLUTION=\d+x(\d+)', stream_info, re.I)
+                    bandwidth = re.search(r'BANDWIDTH=(\d+)', stream_info, re.I)
+                    height = int(resolution.group(1)) if resolution else None
+                    bitrate = int(bandwidth.group(1)) if bandwidth else 0
+                    variants.append((height, bitrate, urljoin(master_url, line)))
+                    stream_info = None
+            eligible = [v for v in variants if v[0] and v[0] <= preferred_height]
+            chosen_variant = (
+                max(eligible, key=lambda v: (v[0], v[1])) if eligible else
+                min(variants, key=lambda v: (v[0] or 10**9, v[1])) if variants else None
+            )
+            if chosen_variant:
+                logging.info(
+                    "resolve_normal_quality: Ziel <=%sp, gewählt %sp",
+                    preferred_height, chosen_variant[0] or 'unbekannt',
+                )
+                return chosen_variant[2]
         # Stream-URLs = Zeilen ohne '#'
         stream_lines = [l for l in lines if not l.startswith('#')]
 
@@ -1856,7 +1941,10 @@ def resolve_mp4_quality(mp4_url: str, preferred: str = 'n') -> str:
         return mp4_url
 
 
-async def download_with_browser(stream_url: str, filepath: str, referer: str | None, cookie_str: str = "") -> bool:
+async def download_with_browser(
+    stream_url: str, filepath: str, referer: str | None,
+    cookie_str: str = "", preferred_height: int | None = None,
+) -> bool:
     """Lädt HLS-Stream via Playwright-Chromium herunter.
     Umgeht TLS-Fingerprint-Erkennung & Single-Use-Token-Schutz."""
     if '.m3u8' not in stream_url:
@@ -1915,19 +2003,35 @@ async def download_with_browser(stream_url: str, filepath: str, referer: str | N
             if is_master:
                 variants = []
                 current_bw = None
+                current_height = None
                 for line in master_text.splitlines():
                     line = line.strip()
                     if line.startswith('#EXT-X-STREAM-INF'):
                         m = re.search(r'BANDWIDTH=(\d+)', line)
                         current_bw = int(m.group(1)) if m else 0
+                        resolution = re.search(r'RESOLUTION=\d+x(\d+)', line, re.I)
+                        current_height = int(resolution.group(1)) if resolution else None
                     elif line and not line.startswith('#') and current_bw is not None:
-                        variants.append((current_bw, urljoin(stream_url, line)))
+                        variants.append((current_height, current_bw, urljoin(stream_url, line)))
                         current_bw = None
+                        current_height = None
 
                 if variants:
-                    variants.sort()
-                    chosen_url = variants[len(variants) // 2][1]
-                    logging.info(f"Browser-Download: {len(variants)} Varianten, gewählt #{len(variants)//2}")
+                    if preferred_height:
+                        eligible = [v for v in variants if v[0] and v[0] <= preferred_height]
+                        chosen = (
+                            max(eligible, key=lambda v: (v[0], v[1])) if eligible else
+                            min(variants, key=lambda v: (v[0] or 10**9, v[1]))
+                        )
+                    else:
+                        variants.sort(key=lambda v: v[1])
+                        chosen = variants[len(variants) // 2]
+                    chosen_url = chosen[2]
+                    logging.info(
+                        "Browser-Download: %s Varianten, gewählt %sp (Ziel: %s)",
+                        len(variants), chosen[0] or 'unbekannt',
+                        f'<= {preferred_height}p' if preferred_height else 'mittel',
+                    )
                     playlist_text = await _fetch_m3u8(chosen_url)
                     if playlist_text is None:
                         return False
@@ -2908,6 +3012,20 @@ def _seriesstream_episode_title(episode_url: str) -> str | None:
     return f"{series_title} S{season:02d}E{episode:02d}"
 
 
+def _absolute_url(base_url: str, value: str) -> str | None:
+    value = (value or '').strip()
+    if not value:
+        return None
+    if value.startswith('//'):
+        return 'https:' + value
+    if value.startswith('/'):
+        parsed = urlparse(base_url)
+        return f"{parsed.scheme}://{parsed.netloc}{value}"
+    if value.startswith(('http://', 'https://')):
+        return value
+    return None
+
+
 def _seriesstream_static_player_link(page_url: str) -> tuple[str | None, str | None]:
     """Extrahiert SerienStream-Playerlinks ohne Browser/Turnstile.
 
@@ -2924,19 +3042,6 @@ def _seriesstream_static_player_link(page_url: str) -> tuple[str | None, str | N
         'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0',
     ]
     preferred = ('VOE', 'Doodstream', 'Dood', 'Dropstream', 'Streamtape', 'Vidoza', 'Filemoon')
-
-    def _absolute_url(base_url: str, value: str) -> str | None:
-        value = (value or '').strip()
-        if not value:
-            return None
-        if value.startswith('//'):
-            return 'https:' + value
-        if value.startswith('/'):
-            parsed = urlparse(base_url)
-            return f"{parsed.scheme}://{parsed.netloc}{value}"
-        if value.startswith(('http://', 'https://')):
-            return value
-        return None
 
     for attempt in range(1, int(os.getenv('SERIENSTREAM_STATIC_ATTEMPTS', '4')) + 1):
         session = requests.Session()
@@ -3051,6 +3156,89 @@ def _seriesstream_static_player_link(page_url: str) -> tuple[str | None, str | N
             if attempt < int(os.getenv('SERIENSTREAM_STATIC_ATTEMPTS', '4')):
                 _time.sleep(float(os.getenv('SERIENSTREAM_STATIC_RETRY_DELAY', '2.5')))
     return None, title
+
+
+def _aniworld_static_player_link(page_url: str) -> str | None:
+    """Extrahiert AniWorld-Playerlinks ohne Browser.
+
+    AniWorld-Episodenseiten enthalten stabile /redirect/<id>-Links pro Provider.
+    Ein normaler GET auf diesen Redirect liefert direkt per 301/302 die externe
+    Playerseite (z. B. VOE oder Doodstream). Das spart den Playwright-Start pro
+    Folge bei der Remote-Queue-Extraktion.
+    """
+    normalized = page_url.strip().rstrip('/')
+    preferred = ('VOE', 'Doodstream', 'Dood', 'Dropstream')
+    user_agents = [
+        USER_AGENT,
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15',
+    ]
+
+    for attempt in range(1, int(os.getenv('ANIWORLD_STATIC_ATTEMPTS', '3')) + 1):
+        session = requests.Session()
+        headers = {
+            'User-Agent': user_agents[(attempt - 1) % len(user_agents)],
+            'Referer': 'https://aniworld.to/',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+        }
+        try:
+            response = session.get(normalized, headers=headers, timeout=25)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+            links = []
+            for anchor in soup.select('a[href*="/redirect/"]'):
+                href = anchor.get('href') or ''
+                text = anchor.get_text(' ', strip=True)
+                links.append({'href': href, 'label': text})
+            links.sort(
+                key=lambda item: next(
+                    (
+                        index for index, name in enumerate(preferred)
+                        if name.lower() in item['label'].lower()
+                    ),
+                    999,
+                )
+            )
+            logging.info(
+                "AniWorld statisch: Versuch %s/%s, Provider=%s",
+                attempt,
+                os.getenv('ANIWORLD_STATIC_ATTEMPTS', '3'),
+                [item['label'] for item in links[:8]],
+            )
+            for item in links:
+                redirect_url = _absolute_url(normalized, item['href'])
+                if not redirect_url:
+                    continue
+                redirect = session.get(
+                    redirect_url,
+                    headers={**headers, 'Referer': normalized},
+                    allow_redirects=False,
+                    timeout=25,
+                )
+                location = redirect.headers.get('Location') or redirect.headers.get('location')
+                target = _absolute_url(redirect_url, location or '')
+                if target and _is_remote_player_source_url(target):
+                    return target
+                html = redirect.text or ''
+                match = re.search(
+                    r'https?://(?:[^\s\"\']+\.)?(?:voe\.sx|voe\.to|dood\.[a-z]+|doodstream\.[a-z]+|dr0pstream\.[a-z]+|dropstream\.[a-z]+)/(?:e|d|embed-[^\s\"\']+\.html)[A-Za-z0-9_.-]*',
+                    html,
+                    re.I,
+                )
+                if match and _is_remote_player_source_url(match.group(0)):
+                    return match.group(0)
+        except Exception as error:
+            logging.warning(
+                "AniWorld statische Player-Link-Extraktion Versuch %s fehlgeschlagen: %s",
+                attempt,
+                error,
+            )
+        if attempt < int(os.getenv('ANIWORLD_STATIC_ATTEMPTS', '3')):
+            _time.sleep(float(os.getenv('ANIWORLD_STATIC_RETRY_DELAY', '1.0')))
+    return None
 
 
 async def get_series_episodes(series_url: str, is_anime: bool = False) -> tuple[str, list[dict]]:
@@ -4680,7 +4868,8 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
                         is_anime: bool = False, progress_prefix: str = "",
                         auto_skip_existing: bool = False,
                         direct_media_url: bool = False,
-                        source_quality_label: str | None = None):
+                        source_quality_label: str | None = None,
+                        preferred_height: int | None = None):
     """Verarbeitung als Background-Task"""
     type_emoji = {"film": "🎬", "serie": "📺", "anime": "🎌", "filmpalast": "🎬"}
 
@@ -4706,6 +4895,12 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
             title = scrape_title(url)
 
         filename = format_filename(title) if title != "..." else "..."
+        preferred_height = preferred_height or _one_time_preferred_height(manual_title)
+        if preferred_height:
+            logging.info(
+                "Einmalige Qualitätsausnahme aktiv: %s maximal %sp",
+                manual_title, preferred_height,
+            )
 
         await msg.edit_text(f"{type_emoji[content_type]} Öffne Player...", parse_mode='Markdown')
 
@@ -4924,7 +5119,9 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
             # Strategie: HLS via Browser (umgeht TLS-Fingerprint-Blocking)
             success = False
             if '.m3u8' in stream_url:
-                success = await download_with_browser(stream_url, filepath, referer, cookie_str)
+                success = await download_with_browser(
+                    stream_url, filepath, referer, cookie_str, preferred_height
+                )
                 if not success:
                     logging.warning("Browser-Download fehlgeschlagen, Fallback auf yt-dlp...")
                     try:
@@ -4935,9 +5132,13 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
                     for key in ('progress_mode', 'segments_done', 'segments_total', 'percent'):
                         _dl_status.pop(key, None)
                     # Für yt-dlp/ffmpeg: Variant explizit auflösen (mittlere Qualität)
-                    stream_url = resolve_normal_quality(stream_url, referer, cookie_str)
+                    stream_url = resolve_normal_quality(
+                        stream_url, referer, cookie_str, preferred_height
+                    )
             if not success:
-                success = await download_with_ytdlp(stream_url, filepath, referer, cookie_str)
+                success = await download_with_ytdlp(
+                    stream_url, filepath, referer, cookie_str, preferred_height
+                )
             if not success:
                 logging.warning("yt-dlp fehlgeschlagen, Fallback auf ffmpeg...")
                 success = await download_with_ffmpeg(stream_url, filepath, referer, cookie_str)
@@ -6040,6 +6241,9 @@ def _load_watchlist() -> list[dict]:
 
 def _watchlist_add(entry_type: str, url: str, chat_id: int | None, is_anime: bool = False) -> bool:
     normalized_url = _normalize_watch_url(url)
+    if 'hdfilme.win' in normalized_url.lower():
+        logging.info("Watchlist: HDFilme-Automatik deaktiviert, Eintrag wird nicht beobachtet: %s", normalized_url)
+        return False
     for item in _watchlist:
         if (
             item.get('type') == entry_type and
@@ -6285,8 +6489,13 @@ def _archive_dead_job(persist: dict, reason: str) -> None:
         logging.error(f"Dead-Job sichern fehlgeschlagen: {error}")
 
 
-async def _dl_worker():
-    """Verarbeitet Downloads sequenziell."""
+async def _dl_worker(worker_id: int = 1):
+    """Verarbeitet einen Pipeline-Slot.
+
+    FFmpeg läuft bereits als echter asyncio-Subprozess. Mehrere Slots sorgen
+    dafür, dass ein langes Downscaling oder ein Upload nicht mehr den nächsten
+    Download aus der Queue anhält.
+    """
     global _dl_active
     while True:
         item = await _dl_queue.get()
@@ -6312,13 +6521,14 @@ async def _dl_worker():
             _dl_queue.task_done()
             continue
 
+        _dl_active_workers[worker_id] = item
         _dl_active = item
         central_job_id = item.get('persist', {}).get('_central_job_id')
         heartbeat_task = (
             _spawn_task(_central_job_heartbeat(central_job_id), f'central-heartbeat-{central_job_id}')
             if central_job_id else None
         )
-        print(f"[WORKER] Starte: {item['coro'].__name__}", flush=True)
+        print(f"[WORKER {worker_id}] Starte: {item['coro'].__name__}", flush=True)
         succeeded = False
         permanent_failure = False
         failure_text = None
@@ -6341,7 +6551,8 @@ async def _dl_worker():
         finally:
             if heartbeat_task:
                 heartbeat_task.cancel()
-            _dl_active = None
+            _dl_active_workers.pop(worker_id, None)
+            _dl_active = next(iter(_dl_active_workers.values()), None)
             if permanent_failure:
                 persist = item.get('persist', {})
                 persist['permanent_failure'] = True
@@ -6369,10 +6580,76 @@ async def _dl_worker():
                 _persist_queue('completed')
             elif not succeeded:
                 persist = item.get('persist', {})
-                persist['failure_count'] = int(persist.get('failure_count', 0)) + 1
+                # Bei Remote-Jobs ist _central_attempts der DB-Zähler des
+                # aktuellen Claims. Vorher wurde nur der lokale persist-Zähler
+                # erhöht; der startet bei jedem Remote-Claim neu und erzeugte
+                # dadurch Endlos-Retry alle 5 Minuten.
+                local_failures = int(persist.get('failure_count', 0) or 0) + 1
+                central_attempts = int(persist.get('_central_attempts', 0) or 0)
+                persist['failure_count'] = max(local_failures, central_attempts)
                 persist['last_error'] = (failure_text or 'Unbekannter Fehler')[:500]
                 persist['last_failed_at'] = _utc_now_iso()
                 item['failed'] = True
+
+                if _looks_like_http_404(failure_text):
+                    stop_reason = f"HTTP 404 – Datei dauerhaft nicht verfügbar: {persist['last_error']}"[:500]
+                    persist['permanent_failure'] = True
+                    _archive_dead_job(persist, stop_reason)
+                    if item in _dl_pending:
+                        _dl_pending.remove(item)
+                    if persist.get('_central_job_id'):
+                        await asyncio.to_thread(
+                            _central_queue.dead,
+                            persist['_central_job_id'], CENTRAL_QUEUE_WORKER_ID,
+                            stop_reason,
+                        )
+                        _persist_queue('central-http-404-dead')
+                        logging.error(
+                            "Zentraler Queue-Eintrag #%s wegen HTTP 404 ohne Retry gestoppt: %s",
+                            persist['_central_job_id'], _queue_item_label(persist),
+                        )
+                        _dl_queue.task_done()
+                        continue
+                    _persist_queue('http-404-dead')
+                    logging.error(
+                        "Queue-Eintrag wegen HTTP 404 ohne Retry gestoppt: %s",
+                        _queue_item_label(persist),
+                    )
+                    _dl_queue.task_done()
+                    continue
+
+                max_attempts = _failed_retry_max_attempts()
+                if persist['failure_count'] >= max_attempts:
+                    stop_reason = (
+                        f"Nach {persist['failure_count']} Fehlversuchen gestoppt: "
+                        f"{persist['last_error']}"
+                    )[:500]
+                    persist['max_attempts_reached'] = True
+                    _archive_dead_job(persist, stop_reason)
+                    if item in _dl_pending:
+                        _dl_pending.remove(item)
+                    if persist.get('_central_job_id'):
+                        await asyncio.to_thread(
+                            _central_queue.dead,
+                            persist['_central_job_id'], CENTRAL_QUEUE_WORKER_ID,
+                            stop_reason,
+                        )
+                        _persist_queue('central-max-attempts-dead')
+                        logging.error(
+                            "Zentraler Queue-Eintrag #%s nach %s/%s Fehlversuchen gestoppt: %s",
+                            persist['_central_job_id'], persist['failure_count'],
+                            max_attempts, _queue_item_label(persist),
+                        )
+                        _dl_queue.task_done()
+                        continue
+                    _persist_queue('max-attempts-dead')
+                    logging.error(
+                        "Queue-Eintrag nach %s/%s Fehlversuchen gestoppt: %s",
+                        persist['failure_count'], max_attempts, _queue_item_label(persist),
+                    )
+                    _dl_queue.task_done()
+                    continue
+
                 delay = _failed_retry_delay(persist['failure_count'])
                 persist['retry_delay_seconds'] = delay
                 if persist.get('_central_job_id'):
@@ -6385,8 +6662,9 @@ async def _dl_worker():
                         _dl_pending.remove(item)
                     _persist_queue('central-failed-released')
                     logging.error(
-                        "Zentraler Queue-Eintrag #%s in %ss erneut verfügbar: %s",
+                        "Zentraler Queue-Eintrag #%s in %ss erneut verfügbar: %s (Fehler %s/%s)",
                         persist['_central_job_id'], delay, _queue_item_label(persist),
+                        persist['failure_count'], max_attempts,
                     )
                     _dl_queue.task_done()
                     continue
@@ -6397,8 +6675,8 @@ async def _dl_worker():
                 )
                 item['retry_task'] = retry_task
                 logging.error(
-                    "Queue-Eintrag bleibt erhalten und wird in %ss hinten eingereiht: %s (Fehler %s)",
-                    delay, _queue_item_label(persist), persist['failure_count']
+                    "Queue-Eintrag bleibt erhalten und wird in %ss hinten eingereiht: %s (Fehler %s/%s)",
+                    delay, _queue_item_label(persist), persist['failure_count'], max_attempts
                 )
             _dl_queue.task_done()
             # verbleibende Positionen aktualisieren
@@ -6442,7 +6720,7 @@ def _queue_item_already_done(persist: dict) -> bool:
 def _remote_queue_groups(jobs: list[dict]) -> tuple[list[dict], list[dict]]:
     """Bündelt offene Remote-Jobs für die Anzeige nach Serie und Staffel."""
     processing = [job for job in jobs if job.get('status') == 'processing']
-    queued = [job for job in jobs if job.get('status') == 'queued']
+    queued = [job for job in jobs if job.get('status') in ('queued', 'paused')]
     groups: list[dict] = []
     indexes: dict[tuple, int] = {}
 
@@ -6496,6 +6774,7 @@ def _remote_queue_groups(jobs: list[dict]) -> tuple[list[dict], list[dict]]:
             'anchor_id': int(first['id']),
             'label': label,
             'count': len(group_jobs),
+            'paused': all(job.get('status') == 'paused' for job in group_jobs),
         })
     return processing, groups
 
@@ -6527,7 +6806,8 @@ async def _remote_queue_view(page: int = 0) -> tuple[str, InlineKeyboardMarkup |
             lines.append(f"   + {len(processing) - 3} weitere aktive Jobs")
     lines.append('')
     for offset, group in enumerate(visible, start + 1):
-        lines.append(f"{offset}. {group['label']}")
+        state = "⏸ " if group.get('paused') else ""
+        lines.append(f"{offset}. {state}{group['label']}")
 
     keyboard: list[list[InlineKeyboardButton]] = []
     for offset, group in enumerate(visible, start + 1):
@@ -6542,6 +6822,15 @@ async def _remote_queue_view(page: int = 0) -> tuple[str, InlineKeyboardMarkup |
             InlineKeyboardButton(
                 f"🗑 {offset} löschen",
                 callback_data=f"rqask:cancel:{anchor}:{page}",
+            ),
+            InlineKeyboardButton(
+                f"{'▶️' if group.get('paused') else '⏸'} {offset} "
+                f"{'fortsetzen' if group.get('paused') else 'pausieren'}",
+                callback_data=(
+                    f"rqpause:resume:{anchor}:{page}"
+                    if group.get('paused') else
+                    f"rqpause:pause:{anchor}:{page}"
+                ),
             ),
             InlineKeyboardButton(
                 f"✅ {offset} vorhanden",
@@ -6594,6 +6883,19 @@ async def handle_remote_queue_positions(update: Update, context: ContextTypes.DE
     page = 0
     if query.data.startswith('rqpage:'):
         page = int(query.data.split(':', 1)[1])
+    elif query.data.startswith('rqpause:'):
+        _prefix, action, anchor_text, page_text = query.data.split(':', 3)
+        page = int(page_text)
+        result = await asyncio.to_thread(
+            _central_queue.set_group_paused,
+            int(anchor_text),
+            action == 'pause',
+        )
+        if result:
+            logging.info(
+                "Remote-Queue-Gruppe #%s: %s (%s Jobs)",
+                anchor_text, action, result['count'],
+            )
     elif query.data.startswith('rqask:'):
         _prefix, action, anchor_text, page_text = query.data.split(':', 3)
         page = int(page_text)
@@ -7178,6 +7480,12 @@ async def cmd_megakino_last_added(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def cmd_hdfilme_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "⏸️ HDFilme-Automatik ist deaktiviert. "
+        "SerienStream, Megakino, AniWorld und Filmpalast bleiben aktiv."
+    )
+    return
+
     chat_id = update.effective_chat.id
     msg = await update.message.reply_text("🔍 Prüfe HDFilme: neueste Filme und Serien...")
 
@@ -8110,15 +8418,20 @@ async def _restore_queue_job(app: Application, item_data: dict) -> None:
                        item_data['url'], item_data['content_type'],
                        item_data.get('manual_title'), item_data.get('is_anime', False),
                        "", False, item_data.get('direct_media_url', False),
-                       item_data.get('source_quality_label'), **common)
+                       item_data.get('source_quality_label'),
+                       item_data.get('preferred_height'), **common)
 
 
 async def _central_queue_worker(app: Application) -> None:
-    """Reserviert atomar genau einen PostgreSQL-Job für diesen Rechner."""
+    """Füllt freie Pipeline-Slots atomar aus der PostgreSQL-Queue."""
     poll_seconds = max(1, int(os.getenv('CENTRAL_QUEUE_POLL_SECONDS', '5')))
     while True:
         try:
-            if not _dl_pending and _dl_active is None:
+            # qsize + aktive Worker bildet die tatsächlich belegten Slots ab.
+            # Fehlgeschlagene Jobs, die auf ihren Retry-Timer warten, blockieren
+            # dadurch keine neuen Downloads.
+            occupied_slots = len(_dl_active_workers) + _dl_queue.qsize()
+            if occupied_slots < PIPELINE_CONCURRENCY:
                 claimed = await asyncio.to_thread(
                     _central_queue.claim, CENTRAL_QUEUE_WORKER_ID
                 )
@@ -8285,7 +8598,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(handle_reupload, pattern="^reupload_"))
     app.add_handler(CallbackQueryHandler(handle_cancel_queue, pattern="^cancel_queue_"))
     app.add_handler(CallbackQueryHandler(handle_clear_remote_queue, pattern="^clear_remote_queue_"))
-    app.add_handler(CallbackQueryHandler(handle_remote_queue_positions, pattern="^rq(?:mv|page|ask|do):"))
+    app.add_handler(CallbackQueryHandler(handle_remote_queue_positions, pattern="^rq(?:mv|page|pause|ask|do):"))
     app.add_handler(CallbackQueryHandler(handle_central_type, pattern="^central_type_"))
 
     print("🤖 Bot läuft!")
@@ -8298,7 +8611,6 @@ async def main():
             BotCommand("queue", "📋 Warteschlange anzeigen & verwalten"),
             BotCommand("watchcheck", "🔍 Watchlist jetzt prüfen"),
             BotCommand("megakino_last_added", "🆕 Megakino Zuletzt hinzugefügt"),
-            BotCommand("hdfilme_latest", "🆕 HDFilme neueste Filme/Serien"),
             BotCommand("filmpalast_import", "🆕 Filmpalast neue Filme/Folgen"),
             BotCommand("status", "📊 Aktueller Download-Status"),
             BotCommand("filmimport", "🎬 Film manuell per Player-Link"),
@@ -8308,7 +8620,12 @@ async def main():
             BotCommand("remotequeue_download", "▶️ Remote Queue mit Chromium starten"),
             BotCommand("remotequeue_clear", "🗑 Wartende Remote Queue leeren"),
         ])
-        _spawn_task(_dl_worker(), "download-worker")
+        for worker_id in range(1, PIPELINE_CONCURRENCY + 1):
+            _spawn_task(_dl_worker(worker_id), f"download-worker-{worker_id}")
+        logging.info(
+            "Download/Downscale/Upload-Pipeline gestartet: %s parallele Slots",
+            PIPELINE_CONCURRENCY,
+        )
 
         saved = _load_queue() if CENTRAL_QUEUE_ROLE == 'local' else []
         if saved:
