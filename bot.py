@@ -8292,8 +8292,10 @@ async def handle_application_error(update: object, context: ContextTypes.DEFAULT
 
 async def _polling_watchdog(app: Application):
     """Startet Telegram-Polling und startet es neu, falls der interne Task stirbt."""
-    while True:
+    while not _shutdown_requested.is_set():
         try:
+            if _shutdown_requested.is_set():
+                return
             if not app.updater.running:
                 logging.info("Telegram Polling wird gestartet")
                 await app.updater.start_polling(
@@ -8512,6 +8514,8 @@ async def _graceful_shutdown(app: Application) -> None:
                 proc.kill()
 
     await _task_supervisor.cancel_all(exclude=asyncio.current_task())
+    if app.updater and app.updater.running:
+        await app.updater.stop()
     if app.running:
         await app.stop()
     if tg_client.is_connected():
