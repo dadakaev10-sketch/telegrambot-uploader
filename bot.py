@@ -40,13 +40,21 @@ from playwright.async_api import Error as PlaywrightError, async_playwright
 from central_media_db import CentralMediaDB
 from central_queue import CentralQueue
 from app.config import load_settings
+from app.maintenance import rotate_file
+from app.runtime import TaskSupervisor
+from app.logging_setup import configure_logging
 from app.media.files import cleanup_stale_temp_files
+from app.media.downloader import DownloadPolicy
 from app.media.quality import (
     choose_hls_variant,
     one_time_preferred_height,
     parse_hls_variants,
 )
+from app.extractors.filmpalast import is_series_episode as is_filmpalast_series_episode
+from app.extractors.player import is_remote_player_url
+from app.telegram.remote_queue_ui import build_remote_queue_groups
 from app.queue.runtime import PipelineRuntime
+from app.queue.retry_policy import RetryPolicy
 from app.extractors.serienstream import (
     is_seriesstream_url as _is_seriesstream_url,
     normalize_seriesstream_url as _normalize_seriesstream_url,
@@ -123,7 +131,7 @@ _watchlist: list[dict] = []
 _reupload_events:  dict[str, asyncio.Event] = {}
 _reupload_choices: dict[str, bool]          = {}
 _central_worker_task: asyncio.Task | None = None
-_background_tasks: set[asyncio.Task] = set()
+_task_supervisor = TaskSupervisor()
 _shutdown_requested = asyncio.Event()
 
 
@@ -145,7 +153,15 @@ PERMANENT_JOB_FAILURE = 'permanent_job_failure'
 
 def _failed_retry_max_attempts() -> int:
     """Maximale Anzahl echter Verarbeitungsversuche vor Dead-Letter."""
-    return max(1, int(os.getenv('FAILED_RETRY_MAX_ATTEMPTS', '3')))
+    return _retry_policy().max_attempts
+
+
+def _retry_policy() -> RetryPolicy:
+    return RetryPolicy(
+        max_attempts=max(1, int(os.getenv('FAILED_RETRY_MAX_ATTEMPTS', '3'))),
+        base_seconds=max(1, int(os.getenv('FAILED_RETRY_BASE_SECONDS', '300'))),
+        max_seconds=3600,
+    )
 
 
 def _utc_now_iso() -> str:
@@ -205,28 +221,14 @@ class _LazyTelegramMessage:
 
 
 def _spawn_task(coro, name: str):
-    task = asyncio.create_task(coro, name=name)
-    _background_tasks.add(task)
-
-    def _log_task_result(done: asyncio.Task):
-        try:
-            done.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logging.error(f"Background task '{name}' beendet:\n{traceback.format_exc()}")
-
-    task.add_done_callback(_log_task_result)
-    task.add_done_callback(_background_tasks.discard)
-    return task
+    return _task_supervisor.spawn(coro, name)
 
 _sys = platform.system()
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if _sys == "Windows" else 0
 
 # ──────────────────────────────────────────────────
 
-logging.basicConfig(level=logging.INFO)
-logging.getLogger("httpx").setLevel(logging.WARNING)
+configure_logging()
 # Session-Name pro Gerät konfigurierbar: verhindert AUTH_KEY_DUPLICATED,
 # wenn der Bot auf mehreren Geräten gleichzeitig läuft (jede Instanz braucht
 # ihren eigenen Auth-Key – mehrere Instanzen auf derselben Session-Datei
@@ -2218,8 +2220,11 @@ async def download_with_ytdlp(stream_url: str, filepath: str, referer: str | Non
             '--external-downloader-args',
             'aria2c:-x 16 -s 16 -k 1M --file-allocation=none --continue=true --max-tries=5 --retry-wait=3',
         ]
-    if preferred_height:
-        cmd += ['-f', f'bestvideo[height<={preferred_height}]+bestaudio/best[height<={preferred_height}]']
+    format_selector = DownloadPolicy(
+        'max_height' if preferred_height else 'best', preferred_height, False
+    ).ytdlp_format()
+    if format_selector:
+        cmd += ['-f', format_selector]
     if referer:
         from urllib.parse import urlparse as _up
         _o = _up(referer)
@@ -4046,24 +4051,8 @@ def _central_source_url_is_valid(source_url: str | None, page_url: str) -> bool:
 
 
 def _is_remote_player_source_url(url: str | None) -> bool:
-    """Erlaubt in PostgreSQL stabile Playerseiten (VOE/Dood/Dropstream).
-
-    Beide Dienste verwenden neben ihren Hauptdomains wechselnde Aliasdomains.
-    Der stabile Teil ist der Playerpfad /e/ bzw. /d/. Generische /embed/- oder
-    kurzlebige CDN-/m3u8-/MP4-Adressen werden bewusst nicht veröffentlicht.
-    """
-    if not url or not url.startswith(('http://', 'https://')):
-        return False
-    from urllib.parse import urlparse
-    parsed = urlparse(url)
-    path = parsed.path.lower()
-    host = (parsed.hostname or '').lower()
-    return (
-        bool(re.match(r'^/(?:e|d)/[^/]+/?$', path))
-        or bool(re.match(r'^/embed-[^/]+\.html$', path))
-        or ('voe.' in host and bool(path.strip('/')))
-        or (any(marker in host for marker in ('dood', 'd0od', 'dr0pstream', 'dropstream')) and bool(path.strip('/')))
-    )
+    """Erlaubt in PostgreSQL stabile Playerseiten (VOE/Dood/Dropstream)."""
+    return is_remote_player_url(url)
 
 
 async def _publish_remote_video(
@@ -6162,7 +6151,7 @@ async def process_kinoger_direct(msg, mp4_url: str, manual_title: str, db_conten
 
 def _is_filmpalast_series(url: str) -> bool:
     """Erkennt eine Serien-Episode auf filmpalast.to (URL enthält -sXXeXX)."""
-    return 'filmpalast.to/stream/' in url and bool(re.search(r'-s\d{2}e\d{2}', url, re.IGNORECASE))
+    return is_filmpalast_series_episode(url)
 
 
 # ─── Queue-Worker ─────────────────────────────────
@@ -6391,8 +6380,7 @@ async def _enqueue(chat_id: int, msg, coro_func, persist: dict, *coro_args,
 
 def _failed_retry_delay(failure_count: int) -> int:
     """Exponentieller Retry-Abstand: standardmäßig 5, 10, 20 ... max. 60 Minuten."""
-    base = max(1, int(os.getenv('FAILED_RETRY_BASE_SECONDS', '300')))
-    return min(base * (2 ** max(0, failure_count - 1)), 3600)
+    return _retry_policy().delay(failure_count)
 
 
 async def _requeue_failed_after(item: dict, delay: int) -> None:
@@ -6672,64 +6660,9 @@ def _queue_item_already_done(persist: dict) -> bool:
 
 def _remote_queue_groups(jobs: list[dict]) -> tuple[list[dict], list[dict]]:
     """Bündelt offene Remote-Jobs für die Anzeige nach Serie und Staffel."""
-    processing = [job for job in jobs if job.get('status') == 'processing']
-    queued = [job for job in jobs if job.get('status') in ('queued', 'paused')]
-    groups: list[dict] = []
-    indexes: dict[tuple, int] = {}
-
-    for job in queued:
-        key = CentralQueue._queue_group_key(job)
-        if key not in indexes:
-            indexes[key] = len(groups)
-            groups.append({'key': key, 'jobs': []})
-        groups[indexes[key]]['jobs'].append(job)
-
-    for group in groups:
-        group_jobs = group['jobs']
-        first = group_jobs[0]
-        payload = first.get('payload') or {}
-        titles = [
-            (job.get('payload') or {}).get('manual_title') or ''
-            for job in group_jobs
-        ]
-        episode_numbers = []
-        season_number = None
-        series_title = None
-        for title in titles:
-            match = re.match(
-                r'^(.*?)\s+S(\d{1,3})E(\d{1,4})(?:\b|\s)',
-                title,
-                re.IGNORECASE,
-            )
-            if match:
-                series_title = series_title or match.group(1).strip()
-                season_number = season_number or int(match.group(2))
-                episode_numbers.append(int(match.group(3)))
-
-        batch_title = first.get('batch_title')
-        if batch_title:
-            label = str(batch_title).replace(' – ', ' · ')
-        elif series_title is not None and season_number is not None:
-            emoji = '🎌' if payload.get('is_anime') else '📺'
-            label = f"{emoji} {series_title} · Staffel {season_number}"
-        else:
-            label = _queue_item_label(payload)
-
-        if len(group_jobs) > 1:
-            label += f" · {len(group_jobs)} Folgen"
-        if episode_numbers:
-            first_ep, last_ep = min(episode_numbers), max(episode_numbers)
-            if first_ep == last_ep:
-                label += f" · E{first_ep:02d}"
-            else:
-                label += f" · E{first_ep:02d}–E{last_ep:02d}"
-        group.update({
-            'anchor_id': int(first['id']),
-            'label': label,
-            'count': len(group_jobs),
-            'paused': all(job.get('status') == 'paused' for job in group_jobs),
-        })
-    return processing, groups
+    return build_remote_queue_groups(
+        jobs, CentralQueue._queue_group_key, _queue_item_label
+    )
 
 
 async def _remote_queue_view(page: int = 0) -> tuple[str, InlineKeyboardMarkup | None]:
@@ -7843,6 +7776,10 @@ async def _run_startup_maintenance() -> None:
             "Startwartung: %s temporäre Dateien entfernt (%.1f MB)",
             len(result.deleted), result.reclaimed_bytes / 1024**2,
         )
+    journal_limit = max(1024, int(os.getenv('JOURNAL_MAX_BYTES', str(10 * 1024**2))))
+    for journal_path in (QUEUE_JOURNAL_FILE, RECEIVED_LINKS_FILE, DEAD_JOBS_FILE):
+        if await asyncio.to_thread(rotate_file, Path(journal_path), journal_limit, 3):
+            logging.info("Startwartung: Journal rotiert: %s", journal_path)
 
 
 # ─── Manuelle Serienliste ────────────────────────
@@ -8570,15 +8507,7 @@ async def _graceful_shutdown(app: Application) -> None:
             if proc.returncode is None:
                 proc.kill()
 
-    current = asyncio.current_task()
-    remaining = [
-        task for task in list(_background_tasks)
-        if task is not current and not task.done()
-    ]
-    for task in remaining:
-        task.cancel()
-    if remaining:
-        await asyncio.gather(*remaining, return_exceptions=True)
+    await _task_supervisor.cancel_all(exclude=asyncio.current_task())
     if app.running:
         await app.stop()
     if tg_client.is_connected():
