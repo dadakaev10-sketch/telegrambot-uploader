@@ -36,3 +36,17 @@ class TaskSupervisor:
             task.cancel()
         if remaining:
             await asyncio.gather(*remaining, return_exceptions=True)
+
+    async def cancel_except_prefixes(
+        self, prefixes: tuple[str, ...], exclude: asyncio.Task | None = None,
+    ) -> None:
+        selected = [
+            task for task in list(self.tasks)
+            if task is not exclude
+            and not task.done()
+            and not task.get_name().startswith(prefixes)
+        ]
+        for task in selected:
+            task.cancel()
+        if selected:
+            await asyncio.gather(*selected, return_exceptions=True)

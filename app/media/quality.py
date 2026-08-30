@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import os
 import re
 import unicodedata
 from urllib.parse import urljoin
@@ -58,8 +60,32 @@ def choose_hls_variant(
     return ordered[len(ordered) // 2]
 
 
+DEFAULT_OVERRIDES: tuple[tuple[str, int], ...] = (
+    (r'^swats0?([1-7])e\d+', 480),
+)
+
+
+def quality_overrides_from_env() -> tuple[tuple[str, int], ...]:
+    raw = os.getenv('QUALITY_OVERRIDES_JSON', '').strip()
+    if not raw:
+        return DEFAULT_OVERRIDES
+    data = json.loads(raw)
+    if not isinstance(data, list):
+        raise ValueError('QUALITY_OVERRIDES_JSON muss eine Liste sein')
+    result: list[tuple[str, int]] = []
+    for item in data:
+        if not isinstance(item, dict) or not item.get('pattern') or not item.get('height'):
+            raise ValueError('Jede Qualitätsregel benötigt pattern und height')
+        re.compile(str(item['pattern']))
+        result.append((str(item['pattern']), int(item['height'])))
+    return tuple(result)
+
+
 def one_time_preferred_height(title: str | None) -> int | None:
-    """Temporary policy: S.W.A.T. seasons 1-7 select at most 480p."""
+    """Select a configured source height without forcing a transcode."""
     normalized = unicodedata.normalize('NFKC', title or '').casefold()
     normalized = re.sub(r'[^a-z0-9]+', '', normalized)
-    return 480 if re.search(r'^swats0?([1-7])e\d+', normalized) else None
+    for pattern, height in quality_overrides_from_env():
+        if re.search(pattern, normalized):
+            return height
+    return None

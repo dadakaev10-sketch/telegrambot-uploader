@@ -42,3 +42,12 @@ def test_swat_exception_only_matches_seasons_one_to_seven():
     assert one_time_preferred_height('SWAT S07E22') == 480
     assert one_time_preferred_height('S.W.A.T. S08E01') is None
     assert one_time_preferred_height('Andere Serie S01E01') is None
+
+
+def test_quality_override_can_be_configured(monkeypatch):
+    monkeypatch.setenv(
+        'QUALITY_OVERRIDES_JSON',
+        '[{"pattern":"^testseries01e","height":360}]',
+    )
+    assert one_time_preferred_height('Testserie S01E03') == 360
+    assert one_time_preferred_height('S.W.A.T. S01E01') is None

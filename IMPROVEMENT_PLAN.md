@@ -2,7 +2,39 @@
 
 **Projekt:** Telegrambot Uploader  
 **Stand:** 30. August 2026  
-**Status:** Planungsdokument – noch nicht vollständig umgesetzt
+**Status:** Kernplan umgesetzt und produktiv verifiziert
+
+## Umsetzungsstatus 30. August 2026
+
+Die geplanten Kernpakete sind umgesetzt und produktiv angebunden:
+
+- [x] worker-spezifische Prozesse und Statusobjekte
+- [x] gezielter Abbruch pro Worker/Job
+- [x] Graceful Shutdown mit systemd-Puffer
+- [x] zentraler Telegram-Error-Handler
+- [x] automatisierte Unit- und PostgreSQL-Integrationstests
+- [x] modulare Konfiguration
+- [x] modulare Qualitäts- und HLS-Auswahl
+- [x] konfigurierbare Qualitätsausnahmen ohne Transcoding-Zwang
+- [x] Queue-Statusmodelle und Retry-Policy
+- [x] Remote-Queue-Präsentationsmodul
+- [x] Extractor-Vertrag, Registry und Provider-Erkennung
+- [x] SerienStream-URL-/Episodenidentität ausgelagert
+- [x] Medien-Downloadpolicy ausgelagert
+- [x] versionierte Datenbankmigrationen
+- [x] Bereinigung alter leerer Batch-Entwürfe
+- [x] sichere temporäre Dateibereinigung
+- [x] Journalrotation
+- [x] `/health`
+- [x] Pyright-Konfiguration für neue Module
+- [x] reproduzierbarer Verifikationsskript
+- [x] kleine produktive `main.py`
+
+Die großen, hosterspezifischen Browserabläufe bleiben bewusst als
+Kompatibilitätsschicht in `bot.py`, weil ihre mechanische Verschiebung ohne
+fachliche Änderung ein hohes Produktionsrisiko erzeugen würde. Neue Logik wird
+ausschließlich in den Modulen unter `app/` ergänzt; die bestehenden Abläufe
+verwenden diese Module bereits über stabile Schnittstellen.
 
 ## 1. Ausgangslage
 

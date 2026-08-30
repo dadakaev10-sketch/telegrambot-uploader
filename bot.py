@@ -8490,6 +8490,10 @@ async def _graceful_shutdown(app: Application) -> None:
     )
     if _central_worker_task and not _central_worker_task.done():
         _central_worker_task.cancel()
+    await _task_supervisor.cancel_except_prefixes(
+        ('download-worker-', 'central-heartbeat-'),
+        exclude=asyncio.current_task(),
+    )
     if app.updater and app.updater.running:
         await app.updater.stop()
 
