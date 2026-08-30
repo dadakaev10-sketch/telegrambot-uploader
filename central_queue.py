@@ -8,6 +8,7 @@ from datetime import timedelta
 
 import psycopg
 from psycopg.rows import dict_row
+from app.database.migrations import apply_migrations
 
 
 SCHEMA_SQL = """
@@ -123,6 +124,7 @@ class CentralQueue:
     def init(self) -> None:
         with self.connect() as con:
             con.execute(SCHEMA_SQL)
+            apply_migrations(con)
             self._migrate_open_film_dedupe_keys(con)
 
     @staticmethod
@@ -732,7 +734,33 @@ class CentralQueue:
                 )
             return {'jobs': selected, 'count': len(selected)}
 
-    def clear_waiting_jobs(self) -> dict[str, int]:
+    def expire_stale_collecting_batches(self, max_age_hours: int = 24) -> int:
+        """Markiert leere, veraltete Extraktionsentwürfe als abgelaufen."""
+        hours = max(1, int(max_age_hours))
+        with self.connect() as con:
+            result = con.execute(
+                """
+                UPDATE download_batches b
+                SET status='cancelled',updated_at=now()
+                WHERE b.status='collecting'
+                  AND b.updated_at < now() - (%s * interval '1 hour')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM download_jobs j
+                      WHERE j.batch_id=b.id AND j.status <> 'cancelled'
+                  )
+                """,
+                (hours,),
+            )
+            return int(result.rowcount)
+
+    def status_counts(self) -> dict[str, int]:
+        with self.connect() as con:
+            rows = con.execute(
+                "SELECT status,count(*) AS count FROM download_jobs GROUP BY status"
+            ).fetchall()
+            return {str(row['status']): int(row['count']) for row in rows}
+
+    def clear_waiting_jobs(self, include_paused: bool = False) -> dict[str, int]:
         """Leert nur offene Download-Jobs der zentralen Queue.
 
         Staffel-Batches in ``download_batches`` sind Entwürfe/Link-Sammlungen,
@@ -741,13 +769,17 @@ class CentralQueue:
         die aktuell sichtbaren Downloadjobs entfernen wollen.
         """
         with self.connect() as con:
+            statuses = ['queued', 'processing']
+            if include_paused:
+                statuses.append('paused')
             cancelled = con.execute(
                 """
                 UPDATE download_jobs
                 SET status='cancelled', updated_at=now(),
                     locked_by=NULL, locked_at=NULL
-                WHERE status IN ('queued','processing')
+                WHERE status=ANY(%s)
                 """,
+                (statuses,),
             ).rowcount
             return {
                 'cancelled': int(cancelled),

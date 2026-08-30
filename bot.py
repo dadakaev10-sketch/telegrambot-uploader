@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import os, re, logging, subprocess, requests, asyncio, platform, json, sqlite3, sys, traceback, ast, socket, unicodedata, time as _time
+import os, re, logging, subprocess, requests, asyncio, platform, json, sqlite3, sys, traceback, ast, socket, signal, shutil, unicodedata, time as _time
 from contextlib import asynccontextmanager
 
 # Windows cp1252 kann keine Emojis → UTF-8 erzwingen
@@ -9,6 +9,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower().replace('-','') != 'utf8'
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 from bs4 import BeautifulSoup
@@ -38,14 +39,27 @@ from camoufox.async_api import AsyncCamoufox
 from playwright.async_api import Error as PlaywrightError, async_playwright
 from central_media_db import CentralMediaDB
 from central_queue import CentralQueue
+from app.config import load_settings
+from app.media.files import cleanup_stale_temp_files
+from app.media.quality import (
+    choose_hls_variant,
+    one_time_preferred_height,
+    parse_hls_variants,
+)
+from app.queue.runtime import PipelineRuntime
+from app.extractors.serienstream import (
+    is_seriesstream_url as _is_seriesstream_url,
+    normalize_seriesstream_url as _normalize_seriesstream_url,
+    parse_episode_identity,
+)
 
 # ─── Config aus .env laden ────────────────────────
 load_dotenv()
-BOT_TOKEN    = os.getenv("BOT_TOKEN")
-API_ID       = int(os.getenv("API_ID"))
-API_HASH     = os.getenv("API_HASH")
-_cid = os.getenv("CHANNEL_ID")
-CHANNEL_ID   = int(_cid) if _cid.lstrip('-').isdigit() else _cid
+SETTINGS = load_settings()
+BOT_TOKEN = SETTINGS.bot_token
+API_ID = SETTINGS.api_id
+API_HASH = SETTINGS.api_hash
+CHANNEL_ID = SETTINGS.channel_id
 DOWNLOAD_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bot')
 QUEUE_FILE    = os.path.join(DOWNLOAD_DIR, 'queue.json')
 QUEUE_BACKUP_FILE = os.path.join(DOWNLOAD_DIR, 'queue.json.bak')
@@ -55,13 +69,9 @@ DEAD_JOBS_FILE = os.path.join(DOWNLOAD_DIR, 'dead_jobs.jsonl')
 PROGRESS_FILE = os.path.join(DOWNLOAD_DIR, 'series_progress.json')
 WATCHLIST_FILE = os.path.join(DOWNLOAD_DIR, 'watchlist.json')
 DB_PATH       = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'media.db')
-DATABASE_URL  = os.getenv('DATABASE_URL', '').strip()
+DATABASE_URL = SETTINGS.database_url
 _central_media_db = CentralMediaDB(DATABASE_URL) if DATABASE_URL else None
-CENTRAL_QUEUE_ROLE = os.getenv('CENTRAL_QUEUE_ROLE', 'local').strip().lower()
-if CENTRAL_QUEUE_ROLE not in ('local', 'producer', 'worker'):
-    raise ValueError("CENTRAL_QUEUE_ROLE muss local, producer oder worker sein")
-if CENTRAL_QUEUE_ROLE != 'local' and not DATABASE_URL:
-    raise ValueError("DATABASE_URL wird für die zentrale Queue benötigt")
+CENTRAL_QUEUE_ROLE = SETTINGS.central_queue_role
 _central_queue = CentralQueue(
     DATABASE_URL,
     int(os.getenv('CENTRAL_QUEUE_LEASE_SECONDS', '7200')),
@@ -76,20 +86,8 @@ CENTRAL_QUEUE_LEGACY_WORKER_PREFIX = (
 CENTRAL_QUEUE_AUTOSTART = os.getenv(
     'CENTRAL_QUEUE_AUTOSTART', 'false'
 ).lower() in ('1', 'true', 'yes', 'on')
-RUN_TELEGRAM_POLLING = os.getenv('RUN_TELEGRAM_POLLING', 'true').lower() in ('1', 'true', 'yes', 'on')
-try:
-    ALLOWED_CHAT_IDS = {
-        int(value.strip())
-        for value in os.getenv('ALLOWED_CHAT_IDS', '').split(',')
-        if value.strip()
-    }
-except ValueError as error:
-    raise ValueError("ALLOWED_CHAT_IDS muss kommaseparierte Telegram-Chat-IDs enthalten") from error
-if RUN_TELEGRAM_POLLING and not ALLOWED_CHAT_IDS:
-    raise ValueError(
-        "Telegram-Polling ist aktiv, aber ALLOWED_CHAT_IDS fehlt. "
-        "Der Bot startet aus Sicherheitsgründen nicht öffentlich."
-    )
+RUN_TELEGRAM_POLLING = SETTINGS.run_telegram_polling
+ALLOWED_CHAT_IDS = set(SETTINGS.allowed_chat_ids)
 # camoufox läuft headless (kein Fenster pro Folge). Falls ALTCHA/VOE mal hängt,
 # SERIENSTREAM_HEADFUL=1 setzen → Browser wird sichtbar (zur Diagnose/Edge-Case).
 SERIENSTREAM_HEADFUL = os.getenv('SERIENSTREAM_HEADFUL', '').lower() in ('1', 'true', 'yes', 'on')
@@ -113,12 +111,10 @@ _dl_queue: asyncio.Queue = asyncio.Queue()
 _dl_pending: list[dict] = []
 _dl_active:  dict | None = None          # gerade verarbeitetes Item
 _dl_active_workers: dict[int, dict] = {} # parallele Pipeline-Slots
-_active_proc: asyncio.subprocess.Process | None = None  # laufender ffmpeg/yt-dlp Prozess
-_dl_status: dict = {}                   # aktueller Download-Status für /status
-try:
-    PIPELINE_CONCURRENCY = max(1, min(4, int(os.getenv('PIPELINE_CONCURRENCY', '2'))))
-except ValueError as error:
-    raise ValueError("PIPELINE_CONCURRENCY muss eine Zahl von 1 bis 4 sein") from error
+_pipeline_runtime = PipelineRuntime()
+_active_procs = _pipeline_runtime.processes
+_dl_statuses = _pipeline_runtime.statuses
+PIPELINE_CONCURRENCY = SETTINGS.pipeline_concurrency
 _seriesstream_extraction_semaphore = asyncio.Semaphore(
     SERIENSTREAM_EXTRACTION_CONCURRENCY
 )
@@ -127,6 +123,22 @@ _watchlist: list[dict] = []
 _reupload_events:  dict[str, asyncio.Event] = {}
 _reupload_choices: dict[str, bool]          = {}
 _central_worker_task: asyncio.Task | None = None
+_background_tasks: set[asyncio.Task] = set()
+_shutdown_requested = asyncio.Event()
+
+
+def _worker_id() -> int:
+    """Liefert den Pipeline-Slot des aktuellen asyncio-Tasks."""
+    return _pipeline_runtime.worker_id()
+
+
+def _job_status() -> dict:
+    """Worker-lokaler Status; Slot 0 ist für Aufgaben außerhalb der Pipeline."""
+    return _pipeline_runtime.status()
+
+
+def _set_active_process(proc: asyncio.subprocess.Process | None) -> None:
+    _pipeline_runtime.set_process(proc)
 
 PERMANENT_JOB_FAILURE = 'permanent_job_failure'
 
@@ -194,6 +206,7 @@ class _LazyTelegramMessage:
 
 def _spawn_task(coro, name: str):
     task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
 
     def _log_task_result(done: asyncio.Task):
         try:
@@ -204,6 +217,7 @@ def _spawn_task(coro, name: str):
             logging.error(f"Background task '{name}' beendet:\n{traceback.format_exc()}")
 
     task.add_done_callback(_log_task_result)
+    task.add_done_callback(_background_tasks.discard)
     return task
 
 _sys = platform.system()
@@ -1840,13 +1854,6 @@ async def get_stream_url(page_url: str, content_type: str, early_db_check=None,
     return stream_url, film_title, referer, cookie_str, source_voe_url
 
 
-def _one_time_preferred_height(title: str | None) -> int | None:
-    """Einmalige Ausnahme: S.W.A.T. Staffel 1–7 höchstens in 480p."""
-    normalized = unicodedata.normalize('NFKC', title or '').casefold()
-    normalized = re.sub(r'[^a-z0-9]+', '', normalized)
-    return 480 if re.search(r'^swats0?([1-7])e\d+', normalized) else None
-
-
 def resolve_normal_quality(
     master_url: str, referer: str | None, cookie_str: str,
     preferred_height: int | None = None,
@@ -1865,30 +1872,14 @@ def resolve_normal_quality(
 
         lines = [l.strip() for l in r.text.splitlines() if l.strip()]
         if preferred_height and '#EXT-X-STREAM-INF' in r.text:
-            from urllib.parse import urljoin
-            variants = []
-            stream_info = None
-            for line in lines:
-                if line.startswith('#EXT-X-STREAM-INF'):
-                    stream_info = line
-                elif not line.startswith('#') and stream_info:
-                    resolution = re.search(r'RESOLUTION=\d+x(\d+)', stream_info, re.I)
-                    bandwidth = re.search(r'BANDWIDTH=(\d+)', stream_info, re.I)
-                    height = int(resolution.group(1)) if resolution else None
-                    bitrate = int(bandwidth.group(1)) if bandwidth else 0
-                    variants.append((height, bitrate, urljoin(master_url, line)))
-                    stream_info = None
-            eligible = [v for v in variants if v[0] and v[0] <= preferred_height]
-            chosen_variant = (
-                max(eligible, key=lambda v: (v[0], v[1])) if eligible else
-                min(variants, key=lambda v: (v[0] or 10**9, v[1])) if variants else None
-            )
+            variants = parse_hls_variants(master_url, r.text)
+            chosen_variant = choose_hls_variant(variants, preferred_height)
             if chosen_variant:
                 logging.info(
                     "resolve_normal_quality: Ziel <=%sp, gewählt %sp",
-                    preferred_height, chosen_variant[0] or 'unbekannt',
+                    preferred_height, chosen_variant.height or 'unbekannt',
                 )
-                return chosen_variant[2]
+                return chosen_variant.url
         # Stream-URLs = Zeilen ohne '#'
         stream_lines = [l for l in lines if not l.startswith('#')]
 
@@ -2001,35 +1992,14 @@ async def download_with_browser(
             # Nur dann als Master behandeln, wenn EXT-X-STREAM-INF vorhanden
             is_master = '#EXT-X-STREAM-INF' in master_text
             if is_master:
-                variants = []
-                current_bw = None
-                current_height = None
-                for line in master_text.splitlines():
-                    line = line.strip()
-                    if line.startswith('#EXT-X-STREAM-INF'):
-                        m = re.search(r'BANDWIDTH=(\d+)', line)
-                        current_bw = int(m.group(1)) if m else 0
-                        resolution = re.search(r'RESOLUTION=\d+x(\d+)', line, re.I)
-                        current_height = int(resolution.group(1)) if resolution else None
-                    elif line and not line.startswith('#') and current_bw is not None:
-                        variants.append((current_height, current_bw, urljoin(stream_url, line)))
-                        current_bw = None
-                        current_height = None
-
+                variants = parse_hls_variants(stream_url, master_text)
                 if variants:
-                    if preferred_height:
-                        eligible = [v for v in variants if v[0] and v[0] <= preferred_height]
-                        chosen = (
-                            max(eligible, key=lambda v: (v[0], v[1])) if eligible else
-                            min(variants, key=lambda v: (v[0] or 10**9, v[1]))
-                        )
-                    else:
-                        variants.sort(key=lambda v: v[1])
-                        chosen = variants[len(variants) // 2]
-                    chosen_url = chosen[2]
+                    chosen = choose_hls_variant(variants, preferred_height)
+                    assert chosen is not None
+                    chosen_url = chosen.url
                     logging.info(
                         "Browser-Download: %s Varianten, gewählt %sp (Ziel: %s)",
-                        len(variants), chosen[0] or 'unbekannt',
+                        len(variants), chosen.height or 'unbekannt',
                         f'<= {preferred_height}p' if preferred_height else 'mittel',
                     )
                     playlist_text = await _fetch_m3u8(chosen_url)
@@ -2050,7 +2020,7 @@ async def download_with_browser(
                 logging.error("Browser-Download: keine Segmente gefunden")
                 return False
             logging.info(f"Browser-Download: {len(segments)} Segmente")
-            _dl_status.update({
+            _job_status().update({
                 'progress_mode': 'segments',
                 'segments_done': 0,
                 'segments_total': len(segments),
@@ -2074,7 +2044,7 @@ async def download_with_browser(
                                 if seg_data[idx] is None:
                                     seg_data[idx] = data
                                     completed_segments += 1
-                                    _dl_status.update({
+                                    _job_status().update({
                                         'segments_done': completed_segments,
                                         'segments_total': len(segments),
                                         'percent': int(
@@ -2267,16 +2237,15 @@ async def download_with_ytdlp(stream_url: str, filepath: str, referer: str | Non
         cmd += ['--add-header', f'Cookie:{cookie_str}']
     cmd.append(stream_url)
 
-    global _active_proc
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
         creationflags=_NO_WINDOW,
     )
-    _active_proc = proc
+    _set_active_process(proc)
     _, stderr = await proc.communicate()
-    _active_proc = None
+    _set_active_process(None)
 
     if proc.returncode == 0:
         if not os.path.exists(filepath):
@@ -2351,16 +2320,15 @@ async def download_with_ffmpeg(stream_url: str, filepath: str, referer: str | No
         '-aspect', '16:9', '-loglevel', 'error', filepath, '-y',
     ]
 
-    global _active_proc
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
         creationflags=_NO_WINDOW,
     )
-    _active_proc = proc
+    _set_active_process(proc)
     _, stderr = await proc.communicate()
-    _active_proc = None
+    _set_active_process(None)
 
     if proc.returncode != 0 and b'sample rate not set' in stderr.lower():
         logging.warning(
@@ -2383,9 +2351,9 @@ async def download_with_ffmpeg(stream_url: str, filepath: str, referer: str | No
             stderr=asyncio.subprocess.PIPE,
             creationflags=_NO_WINDOW,
         )
-        _active_proc = proc
+        _set_active_process(proc)
         _, stderr = await proc.communicate()
-        _active_proc = None
+        _set_active_process(None)
 
     if proc.returncode in (-9, -15):
         logging.info("ffmpeg: abgebrochen")
@@ -2419,9 +2387,9 @@ async def download_with_ffmpeg(stream_url: str, filepath: str, referer: str | No
                 stderr=asyncio.subprocess.PIPE,
                 creationflags=_NO_WINDOW,
             )
-            _active_proc = proc
+            _set_active_process(proc)
             _, stderr = await proc.communicate()
-            _active_proc = None
+            _set_active_process(None)
             if proc.returncode != 0:
                 logging.error(
                     f"ffmpeg Video-only Fehler: {stderr.decode(errors='replace')[-500:]}"
@@ -2927,27 +2895,6 @@ async def upload_with_telethon(filepath: str, caption: str, progress_msg, progre
 
 # ─── Serien-Scraper ──────────────────────────────
 
-_SERIESSTREAM_HOSTS = {'s.to', 'www.s.to', 'serienstream.to', 'www.serienstream.to'}
-
-
-def _is_seriesstream_url(url: str) -> bool:
-    """Erkennt die aktuelle Domain und alte gespeicherte s.to-Links."""
-    try:
-        from urllib.parse import urlparse
-        return (urlparse(url).hostname or '').lower() in _SERIESSTREAM_HOSTS
-    except Exception:
-        return False
-
-
-def _normalize_seriesstream_url(url: str) -> str:
-    """Migriert alte s.to-Links transparent auf serienstream.to."""
-    if not _is_seriesstream_url(url):
-        return url
-    from urllib.parse import urlsplit, urlunsplit
-    parsed = urlsplit(url)
-    return urlunsplit((parsed.scheme or 'https', 'serienstream.to', parsed.path, parsed.query, parsed.fragment))
-
-
 def _fetch_seriesstream_series(series_url: str) -> tuple[str, list[dict]]:
     """Liest Titel, Staffeln und Episoden aus dem statischen SerienStream-HTML."""
     from urllib.parse import urljoin
@@ -2993,23 +2940,20 @@ def _fetch_seriesstream_series(series_url: str) -> tuple[str, list[dict]]:
 
 def _seriesstream_episode_title(episode_url: str) -> str | None:
     """Erzeugt für eine einzelne SerienStream-Folge den kanonischen DB-Titel."""
-    normalized = _normalize_seriesstream_url(episode_url).rstrip('/')
-    match = re.search(r'/staffel-(\d+)/episode-(\d+)(?:/|$)', normalized, re.I)
-    if not match:
+    identity = parse_episode_identity(episode_url)
+    if not identity:
         return None
-    season, episode = int(match.group(1)), int(match.group(2))
-    series_base_url = normalized[:match.start()]
     response = requests.get(
-        series_base_url,
+        identity.series_base_url,
         headers={'User-Agent': USER_AGENT, 'Referer': 'https://serienstream.to/'},
         timeout=30,
     )
     response.raise_for_status()
-    overview = _sto_parse_html(response.text, series_base_url)
+    overview = _sto_parse_html(response.text, identity.series_base_url)
     series_title = str(overview.get('title') or '').strip()
     if not series_title:
         return None
-    return f"{series_title} S{season:02d}E{episode:02d}"
+    return f"{series_title} S{identity.season:02d}E{identity.episode:02d}"
 
 
 def _absolute_url(base_url: str, value: str) -> str | None:
@@ -3387,7 +3331,11 @@ async def get_series_episodes(series_url: str, is_anime: bool = False) -> tuple[
                 if not player_url:
                     return title, []
 
-                player = requests.get(player_url, headers={**headers, 'Referer': series_url}, timeout=25)
+                player = requests.get(
+                    player_url,
+                    headers={**headers, 'Referer': series_url},
+                    timeout=25,
+                )
                 player.raise_for_status()
                 psoup = BeautifulSoup(player.text, 'html.parser')
 
@@ -4895,7 +4843,7 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
             title = scrape_title(url)
 
         filename = format_filename(title) if title != "..." else "..."
-        preferred_height = preferred_height or _one_time_preferred_height(manual_title)
+        preferred_height = preferred_height or one_time_preferred_height(manual_title)
         if preferred_height:
             logging.info(
                 "Einmalige Qualitätsausnahme aktiv: %s maximal %sp",
@@ -5080,8 +5028,8 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
             dl_start = _time.monotonic()
             stop_progress = asyncio.Event()
             for key in ('progress_mode', 'segments_done', 'segments_total', 'percent'):
-                _dl_status.pop(key, None)
-            _dl_status.update({'filename': filename, 'start': dl_start, 'size_mb': 0, 'phase': 'download'})
+                _job_status().pop(key, None)
+            _job_status().update({'filename': filename, 'start': dl_start, 'size_mb': 0, 'phase': 'download'})
 
             async def progress_monitor():
                 while not stop_progress.is_set():
@@ -5095,15 +5043,15 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
                         size_mb = os.path.getsize(check) / (1024 * 1024) if os.path.exists(check) else 0
                         elapsed = int(_time.monotonic() - dl_start)
                         m, s = divmod(elapsed, 60)
-                        _dl_status['size_mb'] = size_mb
-                        _dl_status['elapsed'] = elapsed
+                        _job_status()['size_mb'] = size_mb
+                        _job_status()['elapsed'] = elapsed
                         if (
-                            _dl_status.get('progress_mode') == 'segments'
-                            and _dl_status.get('segments_total')
+                            _job_status().get('progress_mode') == 'segments'
+                            and _job_status().get('segments_total')
                         ):
-                            done = int(_dl_status.get('segments_done', 0))
-                            total = int(_dl_status['segments_total'])
-                            percent = int(_dl_status.get('percent', 0))
+                            done = int(_job_status().get('segments_done', 0))
+                            total = int(_job_status()['segments_total'])
+                            percent = int(_job_status().get('percent', 0))
                             progress_text = f"{percent}% · {done}/{total} Segmente"
                         else:
                             progress_text = f"{size_mb:.0f} MB"
@@ -5130,7 +5078,7 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
                     except OSError:
                         pass
                     for key in ('progress_mode', 'segments_done', 'segments_total', 'percent'):
-                        _dl_status.pop(key, None)
+                        _job_status().pop(key, None)
                     # Für yt-dlp/ffmpeg: Variant explizit auflösen (mittlere Qualität)
                     stream_url = resolve_normal_quality(
                         stream_url, referer, cookie_str, preferred_height
@@ -5180,7 +5128,7 @@ async def process_video(msg, url: str, content_type: str, manual_title: str | No
         keep_downloaded_file = True
 
         size_mb = os.path.getsize(filepath) / (1024 * 1024)
-        _dl_status.update({'phase': 'upload', 'size_mb': size_mb, 'elapsed': int(_time.monotonic() - _dl_status.get('start', _time.monotonic()))})
+        _job_status().update({'phase': 'upload', 'size_mb': size_mb, 'elapsed': int(_time.monotonic() - _job_status().get('start', _time.monotonic()))})
         await msg.edit_text(f"📤 Starte Upload... ({size_mb:.1f} MB)")
 
         _db_ct = 'serie' if _is_fp_serie else ('film' if is_filmpalast else content_type)
@@ -5449,8 +5397,8 @@ async def process_bulk_films(msg, page_url: str, start_from: int = 0):
                 logging.info(f"Überspringe Film {i} (bereits erledigt)")
                 continue
             logging.info(f"[{i}/{total}] Starte: {url}")
-            _dl_status['bulk_current'] = i
-            _dl_status['bulk_total'] = total
+            _job_status()['bulk_current'] = i
+            _job_status()['bulk_total'] = total
             try:
                 await msg.edit_text(f"🎬 Film {i}/{total}\n`{url}`", parse_mode='Markdown')
             except TgBadRequest:
@@ -6130,7 +6078,7 @@ async def process_kinoger_direct(msg, mp4_url: str, manual_title: str, db_conten
         # Progress-Monitor
         dl_start = _time.monotonic()
         stop_progress = asyncio.Event()
-        _dl_status.update({'filename': filename, 'start': dl_start, 'size_mb': 0, 'phase': 'download'})
+        _job_status().update({'filename': filename, 'start': dl_start, 'size_mb': 0, 'phase': 'download'})
 
         async def progress_monitor():
             while not stop_progress.is_set():
@@ -6154,8 +6102,8 @@ async def process_kinoger_direct(msg, mp4_url: str, manual_title: str, db_conten
                         size_mb = 0
                     elapsed = int(_time.monotonic() - dl_start)
                     m, s = divmod(elapsed, 60)
-                    _dl_status['size_mb'] = size_mb
-                    _dl_status['elapsed'] = elapsed
+                    _job_status()['size_mb'] = size_mb
+                    _job_status()['elapsed'] = elapsed
                     await msg.edit_text(
                         f"{icon} {progress_prefix}📥 Lade herunter... ⏱ {m:02d}:{s:02d}\n`{filename}`\n💾 {size_mb:.0f} MB",
                         parse_mode='Markdown'
@@ -6184,7 +6132,7 @@ async def process_kinoger_direct(msg, mp4_url: str, manual_title: str, db_conten
         filepath = await remux_video_audio_only(filepath, msg)
         filepath = await downscale_if_needed(filepath, msg)
         size_mb = os.path.getsize(filepath) / (1024 * 1024)
-        _dl_status.update({'phase': 'upload', 'size_mb': size_mb})
+        _job_status().update({'phase': 'upload', 'size_mb': size_mb})
         await msg.edit_text(f"📤 Starte Upload... ({size_mb:.1f} MB)")
 
         caption = build_caption(filename, db_content_type)
@@ -6497,6 +6445,7 @@ async def _dl_worker(worker_id: int = 1):
     Download aus der Queue anhält.
     """
     global _dl_active
+    _pipeline_runtime.bind_worker(worker_id)
     while True:
         item = await _dl_queue.get()
 
@@ -6522,6 +6471,7 @@ async def _dl_worker(worker_id: int = 1):
             continue
 
         _dl_active_workers[worker_id] = item
+        item['_worker_id'] = worker_id
         _dl_active = item
         central_job_id = item.get('persist', {}).get('_central_job_id')
         heartbeat_task = (
@@ -6551,6 +6501,9 @@ async def _dl_worker(worker_id: int = 1):
         finally:
             if heartbeat_task:
                 heartbeat_task.cancel()
+            _set_active_process(None)
+            _pipeline_runtime.clear_worker(worker_id)
+            item.pop('_worker_id', None)
             _dl_active_workers.pop(worker_id, None)
             _dl_active = next(iter(_dl_active_workers.values()), None)
             if permanent_failure:
@@ -7008,7 +6961,7 @@ async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard_rows = []
     for i, item in enumerate(_dl_pending):
         label = _queue_item_label(item.get('persist', {}))
-        if item is _dl_active:
+        if item in _dl_active_workers.values():
             lines.append(f"▶️ *{i+1}.* {label}  _(aktiv)_")
             keyboard_rows.append([
                 InlineKeyboardButton(
@@ -7669,12 +7622,17 @@ async def handle_cancel_queue(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     for item in list(_dl_pending):
         if id(item) == item_id:
-            if item is _dl_active:
+            if item in _dl_active_workers.values():
                 # Laufenden Prozess killen
-                if _active_proc and _active_proc.returncode is None:
+                worker_id = int(item.get('_worker_id') or 0)
+                active_proc = _active_procs.get(worker_id)
+                if active_proc and active_proc.returncode is None:
                     try:
-                        _active_proc.kill()
-                        logging.info("Aktiver Download abgebrochen (kill)")
+                        active_proc.kill()
+                        logging.info(
+                            "Aktiver Download in Worker %s abgebrochen (kill)",
+                            worker_id,
+                        )
                     except Exception:
                         pass
                 item['cancelled'] = True
@@ -7803,56 +7761,88 @@ async def handle_serie_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Zeigt den aktuellen Download/Upload-Status."""
-    import time as _time
-
-    if not _dl_active and not _dl_status:
+    if not _dl_active_workers and not any(_dl_statuses.values()):
         await update.message.reply_text("✅ Nichts aktiv – Bot ist idle.")
         return
 
     lines = []
-
-    # Aktiver Task
-    if _dl_status:
-        filename = _dl_status.get('filename', '?')
-        phase    = _dl_status.get('phase', '?')
-        size_mb  = _dl_status.get('size_mb', 0)
-        elapsed  = _dl_status.get('elapsed', 0)
-        m, s     = divmod(int(elapsed), 60)
-
-        phase_icon = "📥" if phase == 'download' else "📤"
-        phase_text = "Lade herunter" if phase == 'download' else "Uploade"
-
-        bulk_cur = _dl_status.get('bulk_current')
-        bulk_tot = _dl_status.get('bulk_total')
-        if bulk_cur and bulk_tot:
-            lines.append(f"📦 *Bulk: {bulk_cur}/{bulk_tot} Filme*")
-
-        lines.append(f"{phase_icon} *{phase_text}*")
+    for worker_id, item in sorted(_dl_active_workers.items()):
+        status = _dl_statuses.get(worker_id, {})
+        filename = status.get('filename') or _queue_item_label(item.get('persist', {}))
+        phase = status.get('phase', 'starting')
+        size_mb = float(status.get('size_mb', 0) or 0)
+        elapsed = int(status.get('elapsed', 0) or 0)
+        minutes, seconds = divmod(elapsed, 60)
+        phase_icon = "📥" if phase == 'download' else "📤" if phase == 'upload' else "▶️"
+        phase_text = "Lade herunter" if phase == 'download' else "Uploade" if phase == 'upload' else "Startet"
+        lines.append(f"{phase_icon} *Slot {worker_id}: {phase_text}*")
         lines.append(f"📄 `{filename}`")
-        if (
-            phase == 'download'
-            and _dl_status.get('progress_mode') == 'segments'
-            and _dl_status.get('segments_total')
-        ):
-            done = int(_dl_status.get('segments_done', 0))
-            total = int(_dl_status['segments_total'])
-            percent = int(_dl_status.get('percent', 0))
-            lines.append(f"💾 {percent}% · {done}/{total} Segmente")
+        if phase == 'download' and status.get('segments_total'):
+            lines.append(
+                f"💾 {int(status.get('percent', 0))}% · "
+                f"{int(status.get('segments_done', 0))}/{int(status['segments_total'])} Segmente"
+            )
         else:
             lines.append(f"💾 {size_mb:.0f} MB")
-        lines.append(f"⏱ {m:02d}:{s:02d}")
-    elif _dl_active:
-        label = _queue_item_label(_dl_active.get('persist', {}))
-        lines.append(f"▶️ *Aktiv:* {label}")
+        lines.append(f"⏱ {minutes:02d}:{seconds:02d}")
+        lines.append('')
 
     # Warteschlange
-    waiting = [i for i in _dl_pending if i is not _dl_active]
+    active_ids = {id(item) for item in _dl_active_workers.values()}
+    waiting = [item for item in _dl_pending if id(item) not in active_ids]
     if waiting:
         lines.append(f"\n⏳ *Warteschlange:* {len(waiting)} weitere")
         for i, item in enumerate(waiting, 1):
             lines.append(f"  {i}. {_queue_item_label(item.get('persist', {}))}")
 
     await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+
+
+async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kompakter Live-Healthcheck für Queue, Speicher und Verbindungen."""
+    counts = await asyncio.to_thread(_central_queue.status_counts) if _central_queue else {}
+    disk = shutil.disk_usage(DOWNLOAD_DIR)
+    collecting = len(await asyncio.to_thread(_central_queue.collecting_batches)) if _central_queue else 0
+    lines = [
+        "✅ *Bot aktiv*",
+        f"▶️ Aktive Slots: {len(_dl_active_workers)}/{PIPELINE_CONCURRENCY}",
+        f"⏳ Wartend: {counts.get('queued', 0)}",
+        f"⏸ Pausiert: {counts.get('paused', 0)}",
+        f"☠️ Dead: {counts.get('dead', 0)}",
+        f"🧩 Extraktionsentwürfe: {collecting}",
+        f"💾 Frei: {disk.free / 1024**3:.1f} GB",
+        f"🗄 PostgreSQL: {'✅' if _central_queue else '➖'}",
+        f"📡 Telethon: {'✅' if tg_client.is_connected() else '❌'}",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+
+
+async def _run_startup_maintenance() -> None:
+    """Entfernt ausschließlich eindeutig veraltete, nicht aktive Artefakte."""
+    if _central_queue:
+        hours = max(1, int(os.getenv('COLLECTING_BATCH_MAX_AGE_HOURS', '24')))
+        expired = await asyncio.to_thread(
+            _central_queue.expire_stale_collecting_batches, hours
+        )
+        if expired:
+            logging.info("Startwartung: %s leere alte Batch-Entwürfe bereinigt", expired)
+    max_age = max(3600, int(os.getenv('TEMP_FILE_MAX_AGE_SECONDS', '86400')))
+    protected = {
+        Path(DOWNLOAD_DIR, f"{status['filename']}.mp4")
+        for status in _dl_statuses.values() if status.get('filename')
+    }
+    result = await asyncio.to_thread(
+        cleanup_stale_temp_files,
+        Path(DOWNLOAD_DIR),
+        max_age,
+        protected,
+        False,
+    )
+    if result.deleted:
+        logging.info(
+            "Startwartung: %s temporäre Dateien entfernt (%.1f MB)",
+            len(result.deleted), result.reclaimed_bytes / 1024**2,
+        )
 
 
 # ─── Manuelle Serienliste ────────────────────────
@@ -8345,6 +8335,24 @@ def _polling_error_callback(exc):
     logging.warning(f"Telegram Polling Fehler: {exc.__class__.__name__}: {exc}")
 
 
+async def handle_application_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Zentrale Fehlergrenze für Telegram-Commands und Callback-Handler."""
+    error = getattr(context, 'error', None)
+    logging.error(
+        "Telegram-Handler fehlgeschlagen: %s",
+        error,
+        exc_info=(type(error), error, error.__traceback__) if error else None,
+    )
+    effective_message = getattr(update, 'effective_message', None)
+    if effective_message:
+        try:
+            await effective_message.reply_text(
+                "❌ Die Aktion ist intern fehlgeschlagen. Der Fehler wurde protokolliert."
+            )
+        except Exception:
+            logging.warning("Fehlerhinweis konnte nicht an Telegram gesendet werden")
+
+
 async def _polling_watchdog(app: Application):
     """Startet Telegram-Polling und startet es neu, falls der interne Task stirbt."""
     while True:
@@ -8425,7 +8433,7 @@ async def _restore_queue_job(app: Application, item_data: dict) -> None:
 async def _central_queue_worker(app: Application) -> None:
     """Füllt freie Pipeline-Slots atomar aus der PostgreSQL-Queue."""
     poll_seconds = max(1, int(os.getenv('CENTRAL_QUEUE_POLL_SECONDS', '5')))
-    while True:
+    while not _shutdown_requested.is_set():
         try:
             # qsize + aktive Worker bildet die tatsächlich belegten Slots ab.
             # Fehlgeschlagene Jobs, die auf ihren Retry-Timer warten, blockieren
@@ -8535,9 +8543,57 @@ async def _scheduled_auto_checks(app: Application) -> None:
                 await app.bot.send_message(chat_id, "❌ Auto-Check Fehler – Details im Server-Log.")
             except Exception:
                 pass
+
+
+async def _graceful_shutdown(app: Application) -> None:
+    """Stoppt neue Claims, lässt aktive Jobs auslaufen und schließt Clients sauber."""
+    logging.warning(
+        "Graceful Shutdown gestartet: %s aktive Pipeline-Slots",
+        len(_dl_active_workers),
+    )
+    if _central_worker_task and not _central_worker_task.done():
+        _central_worker_task.cancel()
+    if app.updater and app.updater.running:
+        await app.updater.stop()
+
+    timeout = max(10, int(os.getenv('GRACEFUL_SHUTDOWN_SECONDS', '600')))
+    deadline = asyncio.get_running_loop().time() + timeout
+    while _dl_active_workers and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(1)
+
+    if _dl_active_workers:
+        logging.error(
+            "Graceful-Shutdown-Timeout: %s Job(s) werden beendet",
+            len(_dl_active_workers),
+        )
+        for proc in list(_active_procs.values()):
+            if proc.returncode is None:
+                proc.kill()
+
+    current = asyncio.current_task()
+    remaining = [
+        task for task in list(_background_tasks)
+        if task is not current and not task.done()
+    ]
+    for task in remaining:
+        task.cancel()
+    if remaining:
+        await asyncio.gather(*remaining, return_exceptions=True)
+    if app.running:
+        await app.stop()
+    if tg_client.is_connected():
+        await tg_client.disconnect()
+    logging.info("Graceful Shutdown abgeschlossen")
 # ─── Main ────────────────────────────────────────
 
 async def main():
+    _shutdown_requested.clear()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _shutdown_requested.set)
+        except NotImplementedError:
+            pass
     print("[DEBUG] main() gestartet")
     _db_init()
     if _central_queue:
@@ -8555,6 +8611,7 @@ async def main():
                 recovered,
             )
     print("[DEBUG] DB initialisiert")
+    await _run_startup_maintenance()
     _series_progress.update(_load_progress())
     _watchlist.extend(_load_watchlist())
     print("[DEBUG] Progress geladen")
@@ -8586,6 +8643,7 @@ async def main():
     app.add_handler(CommandHandler("hdfilme_latest", cmd_hdfilme_latest))
     app.add_handler(CommandHandler("filmpalast_import", cmd_filmpalast_import))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("filmimport", cmd_film_import))
     app.add_handler(CommandHandler("manuel", cmd_manuel))
     app.add_handler(CommandHandler("centralserie", cmd_centralserie))
@@ -8600,6 +8658,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(handle_clear_remote_queue, pattern="^clear_remote_queue_"))
     app.add_handler(CallbackQueryHandler(handle_remote_queue_positions, pattern="^rq(?:mv|page|pause|ask|do):"))
     app.add_handler(CallbackQueryHandler(handle_central_type, pattern="^central_type_"))
+    app.add_error_handler(handle_application_error)
 
     print("🤖 Bot läuft!")
     print("Link senden → Film / Serie / Anime wählen → fertig")
@@ -8613,6 +8672,7 @@ async def main():
             BotCommand("megakino_last_added", "🆕 Megakino Zuletzt hinzugefügt"),
             BotCommand("filmpalast_import", "🆕 Filmpalast neue Filme/Folgen"),
             BotCommand("status", "📊 Aktueller Download-Status"),
+            BotCommand("health", "🩺 System- und Queue-Healthcheck"),
             BotCommand("filmimport", "🎬 Film manuell per Player-Link"),
             BotCommand("manuel", "✍️ Manuelle Serieneingabe (VOE-Links)"),
             BotCommand("centralserie", "☁️ Serie komplett in zentrale Queue"),
@@ -8661,9 +8721,9 @@ async def main():
             _spawn_task(_scheduled_auto_checks(app), "scheduled-auto-checks")
         else:
             logging.info("Worker-Modus: Telegram-Polling ist deaktiviert")
-        await asyncio.Event().wait()
+        await _shutdown_requested.wait()
+        await _graceful_shutdown(app)
 
 
 if __name__ == '__main__':
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    asyncio.run(main())
