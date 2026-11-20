@@ -5498,10 +5498,19 @@ async def get_megakino_last_added(home_url: str = MEGAKINO_HOME_URL) -> list[dic
         except Exception:
             pass
         html = await page.content()
+        final_url = page.url
         await browser.close()
     from urllib.parse import urlparse as _urlparse
-    _p = _urlparse(home_url)
+    _p = _urlparse(final_url)
     base = f"{_p.scheme}://{_p.netloc}"
+    # Snapshot source order independently of availability and queue processing.
+    # Failed extraction/publication must never erase the previous good snapshot.
+    from app.megakino_carousel import persist_from_html
+    try:
+        if not persist_from_html(html, base):
+            logging.warning("Megakino carousel missing; keeping last good snapshot")
+    except Exception:
+        logging.exception("Megakino carousel snapshot publication failed")
     items = _parse_megakino_last_added_html(html, base)
     logging.info(f"Megakino Last Added: {len(items)} Einträge gefunden")
     return items
